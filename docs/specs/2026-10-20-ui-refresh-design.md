@@ -1,6 +1,6 @@
 # Phase 1: UI refresh
 
-Status: design agreed, not started. Part of the [roadmap](../roadmap.md).
+Status: done. Part of the [roadmap](../roadmap.md).
 
 ## Why
 
