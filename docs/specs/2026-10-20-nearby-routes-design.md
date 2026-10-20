@@ -27,18 +27,18 @@ See "Not planned" in the roadmap: no smart ranking, navigation, saved home locat
 
 ## Behaviour
 
-1. **Location.** Explore has a "Show routes near me" button over the map. If the browser reports location permission is already granted (Permissions API), the page uses it straight away without the button. If permission is denied, unavailable or times out, Explore stays as it is today (newest first) and says why in one short line.
-2. **Precision.** The browser rounds latitude and longitude to two decimals (about 1 km) before sending them. The server never stores them and the request log must not record the query string for this route. Note that the current `TraceLayer::new_for_http()` span includes the full URI, so it needs a custom span that logs the path only.
+1. **Location.** Explore has a "Show routes near me" button over the map. If the browser reports location permission is already granted (Permissions API) and the rider opened plain `/explore` with no query, the page uses it straight away without the button; any explicit filter or sort choice is left alone. If permission is denied, unavailable or times out, Explore stays as it is today (newest first) and says why in one short line.
+2. **Precision.** The browser rounds latitude and longitude to two decimals (about 1 km) before sending them, and the server rounds again so an unrounded value is never used. The server never stores them and the request log must not record the query string for this route. Note that the current `TraceLayer::new_for_http()` span includes the full URI, so it needs a custom span that logs the path only.
 3. **Request.** Server-rendered, like the rest of the site: the page reloads `/explore` with `near=<lat>,<lon>` added to the existing filter query. The server validates the pair (finite, lat −90..90, lon −180..180); an invalid pair is ignored as if absent.
-4. **Results.** With `near` present: public routes only, existing filters still apply (name, region, type, difficulty, min/max km), distance ≤ 50 km, nearest first, at most 20 results, no pagination. The sort control shows "Nearest" and switching to another sort drops `near`.
+4. **Results.** With `near` present: public routes only, existing filters still apply (name, region, type, difficulty, min/max km), distance ≤ 50 km, nearest first, at most 20 results, no pagination. The sort control shows "Nearest" while `near` is present; choosing another sort keeps `near` in the form but ignores it, so the rider can switch back.
 5. **Distance.** Great-circle (haversine) distance from the rider to the closest vertex of the route's public geometry. Each card shows it, e.g. "3.2 km away".
 6. **Empty.** No public routes within 50 km: say so, and link to the unfiltered newest list.
 7. **Map.** The existing MapLibre setup and map style, now also loaded on Explore. One pin per listed route, placed at the first point of its public geometry (a point already visible on the route's own page). The rider's rounded position gets a distinct marker. The map fits all pins. Clicking a pin highlights its card and the reverse; clicking a card opens the route page as today. Without `near`, the map shows pins for the routes on the current page.
-8. **Layout.** Desktop: map and list side by side. Phone: map first, list below, matching the existing rule that the map precedes details on phones.
+8. **Layout.** Desktop: map and list side by side. Phone: map first, list below, matching the existing rule that the map precedes details on phones. The photo banner at the top of Explore becomes a plain heading row; the map is the page's picture now.
 
 ## Data
 
-Add four nullable columns to `routes`: the bounding box of the public geometry (`min_lat`, `max_lat`, `min_lon`, `max_lon`) with an index. They are written wherever `geometry_json` is written (upload and edit) by one domain function in `src/domain/gpx.rs`. A migration adds the columns; existing rows are backfilled once.
+Add four nullable columns to `routes`: the bounding box of the public geometry (`min_lat`, `max_lat`, `min_lon`, `max_lon`) with an index. They are written where `geometry_json` is written (upload; editing cannot change the geometry) by one domain function. A migration adds the columns; rows without a box are filled by an idempotent pass at startup.
 
 Query: select public routes whose box intersects the rider's 50 km box (with filters), then compute exact distances in Rust, drop anything over 50 km, sort and keep 20. At the expected scale this needs no spatial index.
 
@@ -51,5 +51,5 @@ Query: select public routes whose box intersects the rider's 50 km box (with fil
 
 - Backfill mechanism (SQLite JSON functions in the migration, or a one-off pass at startup).
 - Exact markup and CSS, following the Phase 1 style.
-- How pin–card highlighting is wired, within the existing small JavaScript files.
+- How pin–card highlighting is wired, in a small `static/explore.js` loaded only on Explore (no new library).
 - Whether the bounding-box helper lives in `gpx.rs` or a small new domain module.
