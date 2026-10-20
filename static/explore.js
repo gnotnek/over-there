@@ -6,7 +6,8 @@
   const near = element.dataset.near ? element.dataset.near.split(',').map(Number) : null;
 
   // Location is rounded to about 1 km before it leaves the browser.
-  const locate = () => {
+  // An automatic jump replaces the history entry so Back still leaves Explore.
+  const locate = (auto = false) => {
     if (!navigator.geolocation) { status.textContent = "Couldn't find your location. Showing newest routes."; return; }
     if (button) button.disabled = true;
     navigator.geolocation.getCurrentPosition(position => {
@@ -14,7 +15,7 @@
       url.searchParams.set('near', `${position.coords.latitude.toFixed(2)},${position.coords.longitude.toFixed(2)}`);
       url.searchParams.set('sort', 'nearest');
       url.searchParams.delete('page');
-      location.assign(url);
+      if (auto) location.replace(url); else location.assign(url);
     }, error => {
       if (button) button.disabled = false;
       status.textContent = error.code === error.PERMISSION_DENIED
@@ -23,10 +24,10 @@
     }, {timeout: 10000, maximumAge: 600000});
   };
   if (button) {
-    button.addEventListener('click', locate);
+    button.addEventListener('click', () => locate());
     // Only a bare visit to Explore may use an already-granted location; explicit filters and sorts are left alone.
     if (location.search === '' && navigator.permissions?.query) {
-      navigator.permissions.query({name: 'geolocation'}).then(result => { if (result.state === 'granted') locate(); }).catch(() => {});
+      navigator.permissions.query({name: 'geolocation'}).then(result => { if (result.state === 'granted') locate(true); }).catch(() => {});
     }
   }
 

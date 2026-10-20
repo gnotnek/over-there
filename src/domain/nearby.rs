@@ -3,7 +3,8 @@ use serde_json::Value;
 
 pub const RADIUS_M: f64 = 50_000.0;
 pub const LIMIT: usize = 20;
-const METRES_PER_DEGREE: f64 = 111_320.0;
+/// Same sphere as `gpx::haversine`, so the box and the distance agree at the edge.
+const EARTH_RADIUS_M: f64 = 6_371_000.0;
 
 /// A rider location, always rounded to about 1 km before use.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -71,17 +72,20 @@ pub fn bbox(geometry_json: &str) -> Option<BBox> {
 }
 
 pub fn search_box(near: Near, radius_m: f64) -> BBox {
-    let dlat = radius_m / METRES_PER_DEGREE;
+    let delta = radius_m / EARTH_RADIUS_M;
+    let dlat = delta.to_degrees();
     let (min_lat, max_lat) = ((near.lat - dlat).max(-90.0), (near.lat + dlat).min(90.0));
-    let dlon = radius_m / (METRES_PER_DEGREE * near.lat.to_radians().cos());
+    let cos_lat = near.lat.to_radians().cos();
+    // Widest longitude a circle of angular radius delta reaches; it covers a pole once sin(delta) >= cos(lat).
+    let covers_pole = delta.sin() >= cos_lat;
+    let dlon = if covers_pole {
+        180.0
+    } else {
+        (delta.sin() / cos_lat).asin().to_degrees()
+    };
     let (min_lon, max_lon) = (near.lon - dlon, near.lon + dlon);
-    // shortcut: near a pole or the antimeridian the whole longitude band is searched; fine at this scale.
-    if min_lat <= -90.0
-        || max_lat >= 90.0
-        || min_lon < -180.0
-        || max_lon > 180.0
-        || !dlon.is_finite()
-    {
+    // shortcut: around a pole or across the antimeridian the whole longitude band is searched; fine at this scale.
+    if covers_pole || min_lon < -180.0 || max_lon > 180.0 {
         return BBox {
             min_lat,
             max_lat,
@@ -192,23 +196,42 @@ mod tests {
         assert_eq!(bbox(r#"{"type":"MultiLineString","coordinates":[]}"#), None);
     }
 
-    #[test]
-    fn search_box_contains_points_at_the_radius() {
-        let near = Near {
-            lat: 38.7,
-            lon: -9.1,
-        };
-        let b = search_box(near, RADIUS_M);
-        let dlat = 49_900.0 / 111_320.0;
-        let dlon = 49_900.0 / (111_320.0 * near.lat.to_radians().cos());
-        for (lat, lon) in [
+    /// Points 49.99 km due north, south, east and west, measured the way `gpx::haversine` measures.
+    fn points_at_radius(near: Near) -> [(f64, f64); 4] {
+        let delta = 49_990.0 / 6_371_000.0_f64;
+        let dlat = delta.to_degrees();
+        let dlon = (2.0 * ((delta / 2.0).sin() / near.lat.to_radians().cos()).asin()).to_degrees();
+        [
             (near.lat + dlat, near.lon),
             (near.lat - dlat, near.lon),
             (near.lat, near.lon + dlon),
             (near.lat, near.lon - dlon),
+        ]
+    }
+
+    #[test]
+    fn search_box_contains_points_at_the_radius() {
+        for near in [
+            Near {
+                lat: 38.7,
+                lon: -9.1,
+            },
+            Near {
+                lat: 89.0,
+                lon: 0.0,
+            },
         ] {
-            assert!(gpx::haversine(&point(near.lat, near.lon), &point(lat, lon)) < RADIUS_M);
-            assert!(lat >= b.min_lat && lat <= b.max_lat && lon >= b.min_lon && lon <= b.max_lon);
+            let b = search_box(near, RADIUS_M);
+            for (lat, lon) in points_at_radius(near) {
+                if lat > 90.0 {
+                    continue;
+                }
+                assert!(gpx::haversine(&point(near.lat, near.lon), &point(lat, lon)) < RADIUS_M);
+                assert!(
+                    lat >= b.min_lat && lat <= b.max_lat && lon >= b.min_lon && lon <= b.max_lon,
+                    "({lat}, {lon}) outside {b:?} for {near:?}"
+                );
+            }
         }
     }
 
