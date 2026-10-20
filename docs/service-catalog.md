@@ -43,14 +43,16 @@ Tests: `private_routes_need_owner_or_admin`, `public_and_unlisted_are_link_viewa
 
 | Interface | Contract |
 | --- | --- |
-| `parse(&[u8]) -> Result<RouteData, String>` | ≤ 10 MB, UTF-8, `<gpx>` root, no DTD, ≤ 500,000 XML nodes, 2–100,000 points, valid lat/lon. Reads `trk/trkseg/trkpt` and `rte/rtept`. Segments stay separate. Computes distance, gain/loss (3 m deadband), duration |
+| `parse(&[u8]) -> Result<RouteData, String>` | ≤ 10 MB, UTF-8, `<gpx>` root, no DTD, ≤ 500,000 XML nodes, 2–100,000 points, valid lat/lon. Reads `trk/trkseg/trkpt` and `rte/rtept`. Segments stay separate. Computes distance, gain/loss (reference height moving after > 3 m, per segment), duration |
 | `public_segments(&segments, hide_m) -> Result<Vec<Vec<Point>>, String>` | Drops points within `hide_m` of the route's first and last point; errors if nothing is left |
 | `geojson(&segments) -> String` | Simplified `MultiLineString` |
 | `elevation_profile(&segments) -> Option<Vec<(dist, ele, lon, lat)>>` | `None` without elevation |
 | `redacted_gpx(&segments) -> Vec<u8>` | A fresh GPX 1.1 document from the given segments, with elevation and without times |
+| `line_gpx(&[Point]) -> Vec<u8>` | Same format, one segment, named "Planned route": the original file of a drawn route |
+| `drawn_route(line_json, plan_json) -> Result<(Vec<u8>, String), String>` | Checks a [drawn line and plan](contracts.md#drawn-line) and returns the GPX and the plan as JSON |
 | `haversine(&Point, &Point) -> f64` | Metres on a 6,371 km sphere |
 
-Tests: `segments_do_not_join_and_missing_metrics_are_absent`, `rejects_dtd_and_bad_coordinates`, `hiding_keeps_original_unmodified`, `hidden_endpoints_are_absent_from_public_elevation`, `redacted_gpx_drops_times_and_keeps_elevation`.
+Tests: `segments_do_not_join_and_missing_metrics_are_absent`, `rejects_dtd_and_bad_coordinates`, `hiding_keeps_original_unmodified`, `hidden_endpoints_are_absent_from_public_elevation`, `redacted_gpx_drops_times_and_keeps_elevation`, `gentle_climb_counts_in_full`, `small_noise_is_not_climbing`, `line_gpx_round_trips`, `drawn_route_accepts_a_valid_plan`, `drawn_route_rejects_broken_plans`.
 
 ### Nearby search
 
@@ -116,7 +118,7 @@ Most other SQL still lives in the handlers. Move queries here when a second call
 | --- | --- | --- | --- |
 | Discovery | `home`, `explore`, `profile` | — | Nearby search |
 | Route pages and files | `route_detail`, `route_geometry`, `download`, `route_cover`, `route_image`, `avatar` | `routes.download_count` | Route policy |
-| Contribution | `upload_form`, `upload`, `edit_form`, `edit_route`, `delete_route`, `dashboard` | `routes`, `route_images`, files | Route policy, GPX processing, Nearby (bbox) |
+| Contribution | `upload_form`, `draw_form`, `upload`, `edit_form`, `edit_route`, `line_form`, `save_line`, `delete_route`, `dashboard` | `routes`, `route_images`, files | Route policy, GPX processing, Nearby (bbox) |
 | Accounts | `register*`, `login*`, `logout`, `verify_email`, `account_*`, `resend_verification`, `delete_account` | `users` (and every cascade from it), `sessions`, `auth_attempts`, `email_verifications`, `email_send_quota`, files | Authentication, Email validation |
 | Moderation | `report_route`, `admin`, `admin_contributor`, `admin_report` | `route_reports`, `routes.visibility`, `users.contributor_verified_at` | — |
 
@@ -135,6 +137,7 @@ Small scripts, loaded only on the pages that need them. All rendering happens on
 | `static/app.js` | All | Shows the `?notice=` message as a toast | — |
 | `static/route.js` | Route detail | Map with the route line, elevation chart synced to the map, share button | `GET /routes/{slug}/geometry` |
 | `static/explore.js` | Explore | Map with pins, "Near me" geolocation (rounded to 2 decimals before navigation) | Navigates to `/explore?near=…&sort=nearest` |
+| `static/draw.js` | Draw a route, line editor | Click to add points, drag to move, click to remove, Undo/Clear, "Follow roads" switch, live distance and climbing (same rules as the server), straight-line fallback, "Center on me" (location stays in the browser); fills the `line` and `plan` file inputs on submit | BRouter at `ROUTING_URL`, one request per leg |
 
 The data they read from the page is listed in [contracts.md](contracts.md#template-and-script-contract). Without JavaScript every page still renders and every link and form works; only the maps, the chart and "Near me" are missing. If MapLibre fails to load, the scripts show a fallback message in the map area.
 
@@ -147,9 +150,10 @@ Run once in `web::run` before the server accepts requests. A failure stops start
 3. Apply `migrations/`.
 4. `backfill_route_boxes`.
 5. `strip_redacted_times`: rewrites redacted GPX files from before times were dropped. Idempotent; unreadable files are logged and skipped.
-6. Load and compile `templates/page.hbs`.
-7. In `APP_ENV=production`, refuse to start without an HTTPS `BASE_URL`, Brevo settings and a production `MAP_STYLE_URL`.
-8. Log a configuration summary (no secrets).
+6. `recompute_climbing`: when `pending_tasks` has `recompute_climbing`, recounts gain/loss for every route from its original GPX, then deletes the row. Missing or unparsable files are logged and skipped.
+7. Load and compile `templates/page.hbs`.
+8. In `APP_ENV=production`, refuse to start without an HTTPS `BASE_URL`, Brevo settings and a production `MAP_STYLE_URL`.
+9. Log a configuration summary (no secrets).
 
 One background job runs for the life of the process: `purge_every_hour` calls `auth::purge_expired` at startup and then hourly, logging counts when it removes anything and an error if it fails.
 
@@ -160,6 +164,7 @@ One background job runs for the life of the process: `purge_every_hour` calls `a
 | **SQLite** | All structured data | Server | `DATABASE_URL` | App does not start; requests fail with 500 |
 | **Local disk** | GPX and images | Server | `STORAGE_DIR` | Uploads and file endpoints fail with 500 |
 | **Brevo** | Verification email (`POST https://api.brevo.com/v3/smtp/email`) | Server | `BREVO_API_KEY`, `MAIL_FROM` | Register/resend fail with 500 and nothing is saved. Without config (development), the link is logged instead |
+| **BRouter** | Joining drawn points along roads, with elevation | Browser (`draw.js`) | `ROUTING_URL` (default `https://brouter.de/brouter`, a volunteer-run public server; self-hostable) | The leg is drawn straight and dashed with a message; the route can still be saved |
 | **Map style and tiles** | Base map | Browser | `MAP_STYLE_URL` (default `static/map-style.json`, OSM raster, development only) | Map shows a fallback message; lists still work |
 | **unpkg** | MapLibre GL JS 5.24.0 | Browser | Pinned in `templates/page.hbs` | Same as above |
 | **Google Fonts** | Manjari and Inter | Browser | `templates/page.hbs` | System fonts are used |

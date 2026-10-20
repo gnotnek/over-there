@@ -37,7 +37,7 @@ erDiagram
     routes ||--o{ route_reports : "receives"
 ```
 
-`auth_attempts` and `email_send_quota` are standalone counters with no foreign keys.
+`auth_attempts` and `email_send_quota` are standalone counters with no foreign keys. `pending_tasks` lists one-off startup jobs (`name TEXT PRIMARY KEY`); a row is deleted once its job has run.
 
 ## Tables
 
@@ -123,18 +123,19 @@ The core entity. Inserted by `upload`, updated by `edit_route`, `download` and m
 | `difficulty` | TEXT | no | `easy`, `moderate`, `hard` | Gated |
 | `tags` | TEXT | no | Free text, up to 160 chars; not parsed or searched yet | Gated |
 | `visibility` | TEXT CHECK | no | `public`, `unlisted`, `private` | Gated |
-| `gpx_key` | TEXT | no | Storage key of the **original** uploaded GPX, byte for byte | Owner if endpoints are hidden, else Gated |
+| `gpx_key` | TEXT | no | Storage key of the **original** uploaded GPX, byte for byte. For a drawn route, the GPX built from its line (`gpx::line_gpx`), replaced on every line edit | Owner if endpoints are hidden, else Gated |
 | `public_gpx_key` | TEXT | yes | Storage key of the redacted GPX (`gpx::redacted_gpx`). Only set when `hide_endpoints_m > 0` | Gated |
 | `gpx_sha256` | TEXT | no | SHA-256 of the original bytes; blocks the same author uploading the same file twice | Secret |
 | `hide_endpoints_m` | REAL | no | 0, 250, 500 or 1000. Fixed at upload | Gated |
 | `geometry_json` | TEXT | no | Public map line, see [formats](#derived-formats) | Gated |
 | `elevation_json` | TEXT | yes | Public elevation profile, see [formats](#derived-formats). Null when the GPX has no elevation | Gated |
 | `distance_m` | REAL | no | Sum of haversine distances inside each segment of the **original** GPX. Segments are never joined | Gated |
-| `elevation_gain_m`, `elevation_loss_m` | REAL | yes | From the original GPX, ignoring changes of 3 m or less between points (GPS noise). Null when no point pair has elevation | Gated |
+| `elevation_gain_m`, `elevation_loss_m` | REAL | yes | From the original GPX. Counted from a reference height that moves only after a change of more than 3 m (GPS noise is ignored, gradual climbs count in full), per segment. Null when no point pair has elevation. Recomputed for all routes once by `recompute_climbing` when the rule changed | Gated |
 | `duration_s` | INTEGER | yes | Last minus first `<time>`. Only for a single-segment GPX whose times never go backwards; otherwise null | Gated |
 | `download_count` | INTEGER | no | +1 on every `/download` by someone other than the owner or an admin | Public for public routes |
 | `cover_key` | TEXT | yes | Storage key of the cover photo (WebP, longest side ≤ 1600 px) | Gated |
 | `min_lat`, `max_lat`, `min_lon`, `max_lon` | REAL | yes | Bounding box of `geometry_json` (`domain::nearby::bbox`). Prefilter for routes near me. Older rows are filled on startup by `backfill_route_boxes` | Gated |
+| `plan_json` | TEXT | yes | Drawn routes only: `{"points","at","straight"}` (see [contracts](contracts.md#drawn-line)), so the owner can edit the line. Holds the exact start and finish even when endpoints are hidden, so it is only sent to the owner's line editor. Null for uploaded GPX | Owner |
 | `created_at` | TEXT | no | Upload time; default sort order | Gated |
 | `updated_at` | TEXT | no | Set on edit and on moderation removal | Gated |
 

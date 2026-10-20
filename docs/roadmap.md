@@ -20,6 +20,17 @@ Opening Explore shows a map and the public routes closest to the rider. Design: 
 
 Boundaries: nearest is the only ranking, 50 km radius, at most 20 results, location is rounded and never stored, distances use only the public (endpoint-hidden) geometry.
 
+## Phase 3: Plan a route on the map (done)
+
+Riders create a route by clicking points on a map; the line follows roads using BRouter, with elevation, and falls back to straight lines. The owner can edit the line of a drawn route later. Climbing is now counted with a moving reference height so gradual climbs count in full, and saved routes were recomputed. Design: [specs/2026-10-21-draw-route-design.md](specs/2026-10-21-draw-route-design.md).
+
+Boundaries: routing runs in the browser, never on the server; uploaded GPX lines stay fixed; at most 100 points; no address search.
+
+## Phase 4: Show routes the way Komoot does (to be designed)
+
+- Route cards show the line drawn over a real map instead of the cover photo or plain line drawing, without loading a live map per card (likely a small server-made map image).
+- Photos pinned to spots along the route, shown as markers on the route map.
+
 ## Not planned
 
 Open an issue if you want to argue for one of these.

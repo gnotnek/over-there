@@ -1,6 +1,6 @@
 # Phase 3: Plan a route on the map
 
-Status: draft, waiting for approval. Part of the [roadmap](../roadmap.md).
+Status: done. Part of the [roadmap](../roadmap.md).
 
 ## Why
 
