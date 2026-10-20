@@ -146,7 +146,7 @@ The uploader controls endpoint hiding before public sharing. When enabled, a pub
 ## Primary flows and page structure
 
 1. Visitor: home → explore (a map, plus the nearest public routes when the rider shares a location) with title/region/type/difficulty/distance/sort → route detail/map/profile → GPX download.
-2. Contributor: register → verify email → upload GPX → review computed metrics and privacy → publish → dashboard/edit.
+2. Contributor: register (email verification optional; unverified accounts publish up to 5 routes a day, forms carry a hidden honeypot field) → upload GPX → review computed metrics and privacy → publish → dashboard/edit.
 3. Moderator: admin report queue → inspect route → remove content or dismiss → manage contributor badge.
 
 Navigation has Explore, Share, Dashboard (when signed in), and account access. The landing page uses a cycling photo in a route field note and a second wide ride photo, with short copy. The brand palette is black `#0F0F0F`, electric lime `#C6FF2D`, white `#FFFFFF`, charcoal `#2F2F2F` and gray `#808080`, with Manjari for headings and Inter for text; see the [UI refresh design](specs/2026-10-20-ui-refresh-design.md). Every color is a token in the `:root` block of `static/style.css`. Lime is a fill behind black text or a color on black, never text on a light background, and small muted text uses the darker `--muted` gray. Route previews still come from each GPX or contributor photo. Reusable elements are the navigation shell, route preview, metric row, state label, form field, map, and elevation profile. On phones, the explore filters become a stacked form and the map precedes route details.
