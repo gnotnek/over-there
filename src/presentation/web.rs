@@ -190,6 +190,16 @@ fn route_json(r: &RouteRecord) -> Value {
         "endpoint_hidden":r.hide_endpoints_m>0.0,
     })
 }
+/// Map pins for listed routes, at the first point of their public geometry.
+fn pins_json<'a>(routes: impl Iterator<Item = &'a RouteRecord>) -> String {
+    let pins: Vec<Value> = routes
+        .filter_map(|r| {
+            let [lon, lat] = nearby::first_point(&r.geometry_json)?;
+            Some(json!({"slug":r.slug,"title":r.title,"lon":lon,"lat":lat}))
+        })
+        .collect();
+    json!(pins).to_string()
+}
 fn format_duration(s: i64) -> String {
     format!("{}h {}m", s / 3600, (s % 3600) / 60)
 }
@@ -360,7 +370,10 @@ fn router(state: Shared) -> Router {
         .route("/admin/reports/{id}", post(admin_report))
         .nest_service("/static", ServeDir::new("static"))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http())
+        // Log the path only: query strings can carry a rider's rounded location.
+        .layer(TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<Body>| {
+            tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
+        }))
         .with_state(state)
 }
 
@@ -388,6 +401,7 @@ struct ExploreQuery {
     max_km: Option<f64>,
     sort: Option<String>,
     page: Option<i64>,
+    near: Option<String>,
 }
 async fn explore(
     State(state): State<Shared>,
@@ -402,7 +416,35 @@ async fn explore(
     let min_km = q.min_km.unwrap_or(0.0).max(0.0);
     let max_km = q.max_km.unwrap_or(100_000.0).max(min_km);
     let page = q.page.unwrap_or(1).clamp(1, 10_000);
-    let sort = q.sort.unwrap_or_else(|| "newest".into());
+    let sort = q.sort.unwrap_or_default();
+    let near = q.near.as_deref().and_then(nearby::parse_near);
+    let nearby_mode = near.is_some() && (sort.is_empty() || sort == "nearest");
+    let mut data = base_context(&state, &v, "Explore routes", "explore");
+    data["filters"] = json!({"q":query,"region":region,"cycling_type":cycling_type,"difficulty":difficulty,"min_km":if min_km>0.0 {Some(min_km)}else{None},"max_km":if max_km<100_000.0{Some(max_km)}else{None},"popular":sort=="popular","nearest":nearby_mode});
+    data["nearby"] = json!(nearby_mode);
+    if let Some(near) = near {
+        data["near"] = json!(format!("{},{}", near.lat, near.lon));
+    }
+    if let (true, Some(near)) = (nearby_mode, near) {
+        let b = nearby::search_box(near, nearby::RADIUS_M);
+        let candidates: Vec<RouteRecord> = sqlx::query_as("SELECT * FROM routes WHERE visibility='public' AND (?='' OR title LIKE '%'||?||'%') AND (?='' OR region LIKE '%'||?||'%') AND (?='' OR cycling_type=?) AND (?='' OR difficulty=?) AND distance_m>=? AND distance_m<=? AND min_lat<=? AND max_lat>=? AND min_lon<=? AND max_lon>=?")
+            .bind(&query).bind(&query).bind(&region).bind(&region).bind(&cycling_type).bind(&cycling_type).bind(&difficulty).bind(&difficulty).bind(min_km*1000.0).bind(max_km*1000.0)
+            .bind(b.max_lat).bind(b.min_lat).bind(b.max_lon).bind(b.min_lon)
+            .fetch_all(&state.pool).await.map_err(AppError::internal)?;
+        let ranked = nearby::rank(candidates, |r| r.geometry_json.as_str(), near);
+        data["routes"] = json!(ranked
+            .iter()
+            .map(|(r, d)| {
+                let mut route = route_json(r);
+                route["away_km"] = json!(format!("{:.1}", d / 1000.0));
+                route
+            })
+            .collect::<Vec<_>>());
+        data["pins_json"] = json!(pins_json(ranked.iter().map(|(r, _)| r)));
+        data["count"] = json!(ranked.len());
+        data["page_number"] = json!(1);
+        return render(&state, v, data);
+    }
     let sql = if sort == "popular" {
         "SELECT * FROM routes WHERE visibility='public' AND (?='' OR title LIKE '%'||?||'%') AND (?='' OR region LIKE '%'||?||'%') AND (?='' OR cycling_type=?) AND (?='' OR difficulty=?) AND distance_m>=? AND distance_m<=? ORDER BY download_count DESC, created_at DESC LIMIT 12 OFFSET ?"
     } else {
@@ -426,9 +468,8 @@ async fn explore(
     let count:i64=sqlx::query_scalar("SELECT count(*) FROM routes WHERE visibility='public' AND (?='' OR title LIKE '%'||?||'%') AND (?='' OR region LIKE '%'||?||'%') AND (?='' OR cycling_type=?) AND (?='' OR difficulty=?) AND distance_m>=? AND distance_m<=?")
         .bind(&query).bind(&query).bind(&region).bind(&region).bind(&cycling_type).bind(&cycling_type).bind(&difficulty).bind(&difficulty).bind(min_km*1000.0).bind(max_km*1000.0)
         .fetch_one(&state.pool).await.map_err(AppError::internal)?;
-    let mut data = base_context(&state, &v, "Explore routes", "explore");
     data["routes"] = json!(routes.iter().map(route_json).collect::<Vec<_>>());
-    data["filters"] = json!({"q":query,"region":region,"cycling_type":cycling_type,"difficulty":difficulty,"min_km":if min_km>0.0 {Some(min_km)}else{None},"max_km":if max_km<100_000.0{Some(max_km)}else{None},"popular":sort=="popular"});
+    data["pins_json"] = json!(pins_json(routes.iter()));
     data["count"] = json!(count);
     data["page_number"] = json!(page);
     data["has_prev"] = json!(page > 1);
@@ -1602,5 +1643,117 @@ mod tests {
         let (stored, expected) = stored_box(&state).await;
         assert_eq!(stored, expected);
         assert_eq!(routes::backfill_route_boxes(&state.pool).await.unwrap(), 0);
+    }
+
+    /// A synthetic ~1 km line heading north from (lat, lon).
+    fn line_gpx(lat: f64, lon: f64) -> String {
+        let points: String = (0..4)
+            .map(|i| {
+                format!(
+                    "<trkpt lat=\"{:.4}\" lon=\"{lon:.4}\"><ele>5</ele></trkpt>",
+                    lat + i as f64 * 0.003
+                )
+            })
+            .collect();
+        format!("<gpx><trk><trkseg>{points}</trkseg></trk></gpx>")
+    }
+
+    async fn nearby_fixture() -> (Router, tempfile::TempDir) {
+        let (app, state, dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        upload_route(
+            &app,
+            &session,
+            "Alpha Near",
+            &line_gpx(10.009, 20.0),
+            "public",
+            "easy",
+        )
+        .await;
+        upload_route(
+            &app,
+            &session,
+            "Bravo Middle",
+            &line_gpx(10.09, 20.0),
+            "public",
+            "hard",
+        )
+        .await;
+        upload_route(
+            &app,
+            &session,
+            "Charlie Far",
+            &line_gpx(11.8, 20.0),
+            "public",
+            "easy",
+        )
+        .await;
+        upload_route(
+            &app,
+            &session,
+            "Delta Unlisted",
+            &line_gpx(10.009, 20.001),
+            "unlisted",
+            "easy",
+        )
+        .await;
+        (app, dir)
+    }
+
+    async fn explore_body(app: &Router, query: &str) -> String {
+        let response = send(
+            app,
+            "GET",
+            &format!("/explore?{query}"),
+            Body::empty(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+
+    #[tokio::test]
+    async fn explore_near_lists_public_routes_within_radius_nearest_first() {
+        let (app, _dir) = nearby_fixture().await;
+        let body = explore_body(&app, "near=10.00,20.00").await;
+        let (alpha, bravo) = (
+            body.find("Alpha Near").unwrap(),
+            body.find("Bravo Middle").unwrap(),
+        );
+        assert!(alpha < bravo);
+        assert!(!body.contains("Charlie Far"));
+        assert!(!body.contains("Delta Unlisted"));
+        assert!(body.contains("km away"));
+    }
+
+    #[tokio::test]
+    async fn explore_near_keeps_filters() {
+        let (app, _dir) = nearby_fixture().await;
+        let body = explore_body(&app, "near=10.00,20.00&difficulty=hard").await;
+        assert!(body.contains("Bravo Middle"));
+        assert!(!body.contains("Alpha Near"));
+    }
+
+    #[tokio::test]
+    async fn explore_ignores_invalid_near() {
+        let (app, _dir) = nearby_fixture().await;
+        let body = explore_body(&app, "near=999,0").await;
+        for title in ["Alpha Near", "Bravo Middle", "Charlie Far"] {
+            assert!(body.contains(title), "{title}");
+        }
+        assert!(!body.contains("km away"));
+    }
+
+    #[tokio::test]
+    async fn explore_other_sort_ignores_near() {
+        let (app, _dir) = nearby_fixture().await;
+        let body = explore_body(&app, "near=10.00,20.00&sort=newest").await;
+        for title in ["Alpha Near", "Bravo Middle", "Charlie Far"] {
+            assert!(body.contains(title), "{title}");
+        }
+        assert!(!body.contains("km away"));
+        assert!(body.contains("name=\"near\" value=\"10,20\""));
     }
 }
