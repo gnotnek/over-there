@@ -180,6 +180,16 @@ h1,h2,h3{font-family:var(--display);font-weight:700}
 .route-form input[type=file],.settings-layout input[type=file]{height:auto;padding:10px;background:var(--bg)}
 input[type=file]::file-selector-button{margin-right:12px;border:0;border-radius:var(--pill);background:var(--black);color:var(--white);padding:8px 14px;font:600 13px var(--font);cursor:pointer}
 .field-help{font-size:13px;color:var(--muted);margin:0;line-height:1.4}
+.draw-map{height:clamp(380px,55vh,640px);border-radius:var(--r-card);overflow:hidden;background:var(--bg);position:relative}
+.draw-map .map-point{cursor:grab}
+.draw-tools{display:flex;flex-wrap:wrap;align-items:center;gap:10px}
+.draw-follow,.route-form .draw-follow{display:inline-flex;flex-direction:row;align-items:center;gap:8px;font-size:14px;font-weight:600}
+.draw-follow input,.route-form .draw-follow input{width:20px;height:20px;accent-color:var(--black)}
+.draw-stats{margin:0;font-weight:700;font-size:18px}
+.line-form{display:grid;gap:16px}
+.line-form .button{justify-self:start}
+.heading-links{display:flex;flex-wrap:wrap;gap:8px}
+.heading-links a{font-weight:600;padding:10px 18px;border-radius:var(--pill);background:var(--bg)}
 .form-aside{background:var(--bg);padding:26px;border-radius:var(--r-card);display:flex;flex-direction:column;gap:23px;align-self:start;position:sticky;top:12px}
 .form-aside .button{width:100%}
 .danger-form{margin-top:65px;padding-top:20px;border-top:1px solid var(--line)}
@@ -274,6 +284,7 @@ input[type=file]::file-selector-button{margin-right:12px;border:0;border-radius:
 .pagination{gap:10px;padding:24px 0}
 .route-form{grid-template-columns:1fr}
 .form-aside{position:static;order:-1}
+.route-form:has(.draw-map) .form-aside{order:0}
 .route-form .field-row{grid-template-columns:1fr}
 .dashboard-stats{display:grid;grid-template-columns:repeat(2,1fr)}
 .dashboard-stats>div{border:0}
