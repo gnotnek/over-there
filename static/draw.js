@@ -91,8 +91,10 @@
       let dragged = false;
       const marker = new maplibregl.Marker({element: dot, draggable: true}).setLngLat(point).addTo(map);
       marker.on('dragstart', () => { dragged = true; });
-      marker.on('dragend', () => { const {lng, lat} = marker.getLngLat(); queue(() => move(k, [lng, lat])); });
-      dot.addEventListener('click', () => { if (!dragged) queue(() => remove(k)); dragged = false; });
+      // The index is looked up when the edit runs: earlier queued edits may have shifted or removed this point.
+      const at = () => markers.indexOf(marker);
+      marker.on('dragend', () => { const {lng, lat} = marker.getLngLat(); queue(() => at() >= 0 && move(at(), [lng, lat])); });
+      dot.addEventListener('click', () => { if (!dragged) queue(() => at() >= 0 && remove(at())); dragged = false; });
       return marker;
     });
     const {line} = build();
@@ -100,12 +102,18 @@
     stats.textContent = points.length
       ? `${(distance / 1000).toFixed(1)} km · ↑ ${Math.round(ascent(line))} m · ${points.length} ${points.length === 1 ? 'point' : 'points'}`
       : 'Click the map to place your start.';
-    submit.disabled = legs.length === 0;
+    submit.disabled = waiting > 0 || legs.length === 0;
   };
 
   // Edits run one at a time, so a slow routing answer never lands on a newer line.
+  // Saving waits until every queued edit has landed, so the saved line is the one on screen.
   let pending = Promise.resolve();
-  const queue = edit => { pending = pending.then(async () => { status.textContent = ''; await edit(); snap(); render(); }); };
+  let waiting = 0;
+  const queue = edit => {
+    waiting += 1;
+    submit.disabled = true;
+    pending = pending.then(async () => { status.textContent = ''; await edit(); snap(); waiting -= 1; render(); });
+  };
   const add = async point => {
     if (points.length >= 100) { status.textContent = 'A route can have at most 100 points.'; return; }
     points.push(point);
