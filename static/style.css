@@ -183,6 +183,8 @@ input[type=file]::file-selector-button{margin-right:12px;border:0;border-radius:
 .form-aside{background:var(--bg);padding:26px;border-radius:var(--r-card);display:flex;flex-direction:column;gap:23px;align-self:start;position:sticky;top:12px}
 .form-aside .button{width:100%}
 .danger-form{margin-top:65px;padding-top:20px;border-top:1px solid var(--line)}
+.settings-layout>.danger-form{margin-top:0}
+.settings-layout>.danger-form button{justify-self:start}
 .danger-form button{border:1px solid var(--danger);background:none;color:var(--danger);height:var(--control-h);padding:0 22px;border-radius:var(--pill);font-weight:600}
 
 /* Auth */

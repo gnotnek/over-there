@@ -250,9 +250,7 @@ pub fn redacted_gpx(segments: &[Vec<Point>]) -> Vec<u8> {
             if let Some(ele) = p.ele {
                 xml.push_str(&format!("<ele>{ele}</ele>"));
             }
-            if let Some(time) = p.time {
-                xml.push_str(&format!("<time>{}</time>", time.to_rfc3339()));
-            }
+            // Times are left out: they would show when the owner rode, which hiding is meant to protect.
             xml.push_str("</trkpt>");
         }
         xml.push_str("</trkseg>");
@@ -305,5 +303,14 @@ mod tests {
         assert!(profile
             .iter()
             .all(|point| point.2 != 0.0 && point.2 != 0.04));
+    }
+    #[test]
+    fn redacted_gpx_drops_times_and_keeps_elevation() {
+        let xml = br#"<gpx><trk><trkseg><trkpt lat="0" lon="0"><ele>1</ele><time>2026-01-01T08:00:00Z</time></trkpt><trkpt lat="0" lon="0.01"><ele>2</ele><time>2026-01-01T08:05:00Z</time></trkpt></trkseg></trk></gpx>"#;
+        let redacted = redacted_gpx(&parse(xml).unwrap().segments);
+        let reparsed = parse(&redacted).unwrap();
+        assert!(!String::from_utf8(redacted).unwrap().contains("<time>"));
+        assert_eq!(reparsed.duration_s, None);
+        assert_eq!(reparsed.segments[0][1].ele, Some(2.0));
     }
 }

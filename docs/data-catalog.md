@@ -70,7 +70,7 @@ One row per signed-in browser.
 | `expires_at` | TEXT | no | Creation + 30 days | Secret |
 | `created_at` | TEXT | no | | Secret |
 
-Lifecycle: created on register and login; deleted on logout. Expired rows are ignored by the lookup but **not purged**.
+Lifecycle: created on register and login; deleted on logout and account deletion. Expired rows are ignored by the lookup and purged hourly by `auth::purge_expired`.
 
 ### `auth_attempts`
 
@@ -82,7 +82,7 @@ Sign-in throttle: 10 failures per email per 15-minute window.
 | `failures` | INTEGER | no | Failures in the current window | Secret |
 | `window_started_at` | TEXT | no | Start of the current window; reset when the window has passed | Secret |
 
-Lifecycle: upserted on each failed login, deleted on successful login. Rows for unknown emails are never purged.
+Lifecycle: upserted on each failed login, deleted on successful login, and purged hourly once the 15-minute window has passed.
 
 ### `email_verifications`
 
@@ -93,7 +93,7 @@ Lifecycle: upserted on each failed login, deleted on successful login. Rows for 
 | `expires_at` | TEXT | no | Creation + 48 hours | Secret |
 | `sent_at` | TEXT | no | Used to allow one resend per 10 minutes | Secret |
 
-Lifecycle: created on register and resend (resend deletes the old rows first); all rows for the user are deleted once they verify.
+Lifecycle: created on register and resend (resend deletes the old rows first); all rows for the user are deleted once they verify; expired rows are purged hourly.
 
 ### `email_send_quota`
 
@@ -132,7 +132,7 @@ The core entity. Inserted by `upload`, updated by `edit_route`, `download` and m
 | `distance_m` | REAL | no | Sum of haversine distances inside each segment of the **original** GPX. Segments are never joined | Gated |
 | `elevation_gain_m`, `elevation_loss_m` | REAL | yes | From the original GPX, ignoring changes of 3 m or less between points (GPS noise). Null when no point pair has elevation | Gated |
 | `duration_s` | INTEGER | yes | Last minus first `<time>`. Only for a single-segment GPX whose times never go backwards; otherwise null | Gated |
-| `download_count` | INTEGER | no | +1 on every `/download`, including the owner's | Public for public routes |
+| `download_count` | INTEGER | no | +1 on every `/download` by someone other than the owner or an admin | Public for public routes |
 | `cover_key` | TEXT | yes | Storage key of the cover photo (WebP, longest side ≤ 1600 px) | Gated |
 | `min_lat`, `max_lat`, `min_lon`, `max_lon` | REAL | yes | Bounding box of `geometry_json` (`domain::nearby::bbox`). Prefilter for routes near me. Older rows are filled on startup by `backfill_route_boxes` | Gated |
 | `created_at` | TEXT | no | Upload time; default sort order | Gated |
@@ -193,11 +193,11 @@ All in `STORAGE_DIR`, named `{uuid}.{ext}`, served only by handlers that run the
 
 | File | Format | Referenced by | Class | Deleted when |
 | --- | --- | --- | --- | --- |
-| Original GPX | As uploaded (≤ 10 MB) | `routes.gpx_key` | Owner / Gated | Route deleted |
-| Redacted GPX | GPX 1.1, public segments only, keeps `<ele>` and `<time>` | `routes.public_gpx_key` | Gated | Route deleted |
+| Original GPX | As uploaded (≤ 10 MB) | `routes.gpx_key` | Owner / Gated | Route or account deleted |
+| Redacted GPX | GPX 1.1, public segments only, keeps `<ele>`, drops `<time>` | `routes.public_gpx_key` | Gated | Route deleted |
 | Cover photo | WebP, ≤ 1600 px, re-encoded (metadata dropped) | `routes.cover_key` | Gated | Route deleted |
 | Route photo | WebP, ≤ 1600 px, re-encoded | `route_images.image_key` | Gated | Route deleted |
-| Avatar | WebP, ≤ 512 px, re-encoded | `users.avatar_key` | Public | Replaced by a new avatar |
+| Avatar | WebP, ≤ 512 px, re-encoded | `users.avatar_key` | Public | Replaced by a new avatar, or account deleted |
 
 ## Data we deliberately do not keep
 
@@ -205,12 +205,15 @@ All in `STORAGE_DIR`, named `{uuid}.{ext}`, served only by handlers that run the
 - **IP addresses and user agents** are not stored.
 - **Image metadata** (EXIF, including GPS) is discarded by re-encoding.
 - **Raw secrets.** Session and verification tokens are stored only as SHA-256 hashes.
+- **Ride times in visitor downloads.** When endpoints are hidden, the redacted GPX has no `<time>` values, so visitors cannot tell when the owner rode. Files written before this rule are rewritten on startup.
+- **Personal data in logs.** Logs carry user and route IDs, never emails, passwords, tokens, or the `near` location. See [contracts.md](contracts.md#logs).
 
 ## Deletion and retention
 
 - Deleting a route removes its row, its images and reports (cascade), and its files.
+- Deleting an account (`POST /account/delete`, password required) removes the user row, which cascades to sessions, verification links, routes, route photos and reports on those routes, then removes every file of theirs. Reports they filed on other routes stay, with `reporter_id` set to null.
 - Moderation "remove" makes a route private; it deletes nothing.
-- There is no account deletion flow yet. Deleting a `users` row in SQL cascades to sessions, verifications and routes, but **leaves their files** in `STORAGE_DIR`.
-- Expired sessions, expired verifications and old `auth_attempts` rows are not purged.
+- Expired sessions, expired verification links and lapsed `auth_attempts` rows are purged on startup and every hour.
+- Deleting a `users` row by hand in SQL does **not** remove files; use the account deletion flow.
 
 Back up the database and `STORAGE_DIR` together; see the README.

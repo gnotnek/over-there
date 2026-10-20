@@ -126,6 +126,35 @@ pub async fn create_session(
     Ok((token, csrf))
 }
 
+/// Rows removed by `purge_expired`, per table.
+#[derive(Debug, Default, PartialEq)]
+pub struct Purged {
+    pub sessions: u64,
+    pub verifications: u64,
+    pub attempts: u64,
+}
+
+/// Deletes sessions and verification links past expiry and sign-in counters past their window.
+pub async fn purge_expired(pool: &SqlitePool) -> Result<Purged, sqlx::Error> {
+    let sessions = sqlx::query("DELETE FROM sessions WHERE expires_at<=datetime('now')")
+        .execute(pool)
+        .await?;
+    let verifications =
+        sqlx::query("DELETE FROM email_verifications WHERE expires_at<=datetime('now')")
+            .execute(pool)
+            .await?;
+    let attempts = sqlx::query(
+        "DELETE FROM auth_attempts WHERE window_started_at<datetime('now','-15 minutes')",
+    )
+    .execute(pool)
+    .await?;
+    Ok(Purged {
+        sessions: sessions.rows_affected(),
+        verifications: verifications.rows_affected(),
+        attempts: attempts.rows_affected(),
+    })
+}
+
 pub fn session_cookie(token: &str, secure: bool) -> String {
     format!(
         "ot_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000{}",

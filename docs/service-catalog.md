@@ -47,10 +47,10 @@ Tests: `private_routes_need_owner_or_admin`, `public_and_unlisted_are_link_viewa
 | `public_segments(&segments, hide_m) -> Result<Vec<Vec<Point>>, String>` | Drops points within `hide_m` of the route's first and last point; errors if nothing is left |
 | `geojson(&segments) -> String` | Simplified `MultiLineString` |
 | `elevation_profile(&segments) -> Option<Vec<(dist, ele, lon, lat)>>` | `None` without elevation |
-| `redacted_gpx(&segments) -> Vec<u8>` | A fresh GPX 1.1 document from the given segments |
+| `redacted_gpx(&segments) -> Vec<u8>` | A fresh GPX 1.1 document from the given segments, with elevation and without times |
 | `haversine(&Point, &Point) -> f64` | Metres on a 6,371 km sphere |
 
-Tests: `segments_do_not_join_and_missing_metrics_are_absent`, `rejects_dtd_and_bad_coordinates`, `hiding_keeps_original_unmodified`, `hidden_endpoints_are_absent_from_public_elevation`.
+Tests: `segments_do_not_join_and_missing_metrics_are_absent`, `rejects_dtd_and_bad_coordinates`, `hiding_keeps_original_unmodified`, `hidden_endpoints_are_absent_from_public_elevation`, `redacted_gpx_drops_times_and_keeps_elevation`.
 
 ### Nearby search
 
@@ -82,8 +82,9 @@ Tests: `parse_near_*`, `bbox_covers_every_segment`, `search_box_contains_points_
 | `session(pool, headers) -> Option<(User, csrf)>` | Resolves the `ot_session` cookie to a user |
 | `cookie`, `session_cookie`, `csrf_cookie` | Read and build cookies ([contract](contracts.md#cookies)) |
 | `check_csrf(headers, submitted, expected, base_url)` | Token match plus same-origin `Origin` header when present |
+| `purge_expired(pool) -> Result<Purged, sqlx::Error>` | Deletes expired sessions and verification links and lapsed sign-in counters; returns counts per table |
 
-Tests: `passwords_are_salted_and_verified`; HTTP tests in `web.rs` cover sign-in flows.
+Tests: `passwords_are_salted_and_verified`, `purge_removes_only_expired_records`; HTTP tests in `web.rs` cover sign-in flows.
 
 ### Email validation
 
@@ -116,10 +117,10 @@ Most other SQL still lives in the handlers. Move queries here when a second call
 | Discovery | `home`, `explore`, `profile` | — | Nearby search |
 | Route pages and files | `route_detail`, `route_geometry`, `download`, `route_cover`, `route_image`, `avatar` | `routes.download_count` | Route policy |
 | Contribution | `upload_form`, `upload`, `edit_form`, `edit_route`, `delete_route`, `dashboard` | `routes`, `route_images`, files | Route policy, GPX processing, Nearby (bbox) |
-| Accounts | `register*`, `login*`, `logout`, `verify_email`, `account_*`, `resend_verification` | `users`, `sessions`, `auth_attempts`, `email_verifications`, `email_send_quota` | Authentication, Email validation |
+| Accounts | `register*`, `login*`, `logout`, `verify_email`, `account_*`, `resend_verification`, `delete_account` | `users` (and every cascade from it), `sessions`, `auth_attempts`, `email_verifications`, `email_send_quota`, files | Authentication, Email validation |
 | Moderation | `report_route`, `admin`, `admin_contributor`, `admin_report` | `route_reports`, `routes.visibility`, `users.contributor_verified_at` | — |
 
-Shared helpers: `viewer` (who is asking, CSRF token), `require_user`, `csrf`, `get_route`, `can_view`/`can_edit`, `render`, `write_asset`/`serve_image`, `optimized_image`, `AppError`.
+Shared helpers: `viewer` (who is asking, CSRF token), `require_user`, `csrf`, `get_route`, `can_view`/`can_edit`, `render`, `write_asset`/`serve_image`/`remove_assets`, `optimized_image`, `AppError` (logs every 4xx with its reason, every 5xx with its cause).
 
 When this file becomes hard to navigate, split it along the feature rows above into `presentation/{discovery,routes,accounts,admin}.rs`, keeping helpers in `presentation/web.rs`.
 
@@ -145,10 +146,12 @@ Run once in `web::run` before the server accepts requests. A failure stops start
 2. Open SQLite (WAL, foreign keys, 5 connections).
 3. Apply `migrations/`.
 4. `backfill_route_boxes`.
-5. Load and compile `templates/page.hbs`.
-6. In `APP_ENV=production`, refuse to start without an HTTPS `BASE_URL`, Brevo settings and a production `MAP_STYLE_URL`.
+5. `strip_redacted_times`: rewrites redacted GPX files from before times were dropped. Idempotent; unreadable files are logged and skipped.
+6. Load and compile `templates/page.hbs`.
+7. In `APP_ENV=production`, refuse to start without an HTTPS `BASE_URL`, Brevo settings and a production `MAP_STYLE_URL`.
+8. Log a configuration summary (no secrets).
 
-There are no scheduled background jobs.
+One background job runs for the life of the process: `purge_every_hour` calls `auth::purge_expired` at startup and then hourly, logging counts when it removes anything and an error if it fails.
 
 ## External services
 

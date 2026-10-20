@@ -69,6 +69,7 @@ Related: [data-catalog.md](data-catalog.md) (what is stored), [service-catalog.m
 | GET | `/account` | User | Settings form |
 | POST | `/account` | User, CSRF | Updates bio/avatar → `/account?notice=` |
 | POST | `/account/resend-verification` | User, CSRF | New verification email → `/account?notice=` |
+| POST | `/account/delete` | User, CSRF | Deletes the account, its routes and files, signs out → `/?notice=` |
 | GET | `/admin` | Admin | Stats, latest 100 reports and users |
 | POST | `/admin/users/{id}/contributor` | Admin, CSRF | Sets or clears the badge → `/admin` |
 | POST | `/admin/reports/{id}` | Admin, CSRF | Dismisses or acts on a report → `/admin` |
@@ -127,7 +128,7 @@ Form: `csrf` plus the same text fields as upload, except files and `hide_endpoin
 - Owner or admin: the original file.
 - Everyone else: the redacted file if endpoints are hidden, otherwise the original.
 - Headers: `Content-Type: application/gpx+xml`, `Content-Disposition: attachment; filename="{slug}.gpx"`, `Cache-Control: private, no-store`.
-- Every call increments `download_count`.
+- Calls by anyone other than the owner or an admin increment `download_count`.
 
 ### `POST /routes/{slug}/report`
 
@@ -140,6 +141,10 @@ Multipart: `csrf`, `bio` (≤ 300 chars), `avatar` (optional image). A new avata
 ### `POST /account/resend-verification`
 
 Form: `csrf`. Already verified → redirect, no email. 429 if a link was sent in the last 10 minutes or the daily quota is used up.
+
+### `POST /account/delete`
+
+Form: `csrf`, `password` (the account's current password; wrong gives 401 and deletes nothing). On success the account, its routes, their photos, the reports on them and every stored file are removed, `ot_session` is expired, and the response redirects to `/?notice=`. Reports the user filed on other routes stay, without the reporter.
 
 ### `POST /admin/users/{id}/contributor`
 
@@ -179,7 +184,7 @@ Otherwise 403. `SameSite=Lax` cookies add a second layer.
 
 ### GPX output (redacted)
 
-Served to visitors when endpoints are hidden: GPX 1.1, one `<trk>` named "Shared route", one `<trkseg>` per public segment, keeping each kept point's `lat`, `lon`, `<ele>` and `<time>`. Points within the hiding radius of the start or finish are removed. Nothing else from the original file is carried over.
+Served to visitors when endpoints are hidden: GPX 1.1, one `<trk>` named "Shared route", one `<trkseg>` per public segment, keeping each kept point's `lat`, `lon` and `<ele>`. `<time>` is dropped, so the file does not reveal when the owner rode. Points within the hiding radius of the start or finish are removed. Nothing else from the original file is carried over.
 
 ### Route geometry
 
@@ -240,3 +245,56 @@ Read from the environment (and `.env`) at startup. See [.env.example](../.env.ex
 | `BREVO_API_KEY`, `MAIL_FROM` | unset | Email delivery. If unset, verification links are logged |
 | `APP_ENV` | unset | `production` refuses to start without an HTTPS `BASE_URL`, both Brevo variables and a non-default `MAP_STYLE_URL` |
 | `RUST_LOG` | `over_there=info,tower_http=info` | Log filter |
+
+## Logs
+
+Logs go to stdout through `tracing`, filtered by `RUST_LOG`. Operators, dashboards and alerts depend on these messages and field names, so treat them like any other contract.
+
+**Privacy rule:** logs may contain user IDs, route IDs and report IDs. They never contain emails, passwords, tokens, cookie values, query strings (which can carry the `near` location) or file contents. The one exception is the development-only verification link, logged when no email provider is configured.
+
+### Every request
+
+Each request runs in a `request` span with `id` (a random UUID for correlating lines), `method` and `path` (no query string). When it finishes, `tower_http` logs `finished processing request` at INFO with `status` and `latency` in milliseconds. Every line logged while handling the request carries the span's fields.
+
+| Level | Message | Fields | When |
+| --- | --- | --- | --- |
+| INFO | `request rejected` | `status`, `reason` (the user-facing message) | Any 4xx `AppError` |
+| ERROR | `internal error` | `error` | Any 5xx `AppError` |
+| WARN | `csrf check failed` | — | A POST failed the [CSRF contract](#csrf) |
+
+### Events
+
+| Level | Message | Fields |
+| --- | --- | --- |
+| INFO | `account registered` | `user_id` |
+| INFO | `email verified` | `user_id` |
+| INFO | `verification email sent` | `provider` |
+| INFO | `verification link resent` | `user_id` |
+| WARN | `Development email verification link` | `email`, `link` (development only) |
+| WARN | `daily verification email quota reached` | — |
+| INFO | `signed in` | `user_id` |
+| WARN | `sign-in failed` | `known_account` (whether the email exists) |
+| WARN | `sign-in throttled` | — |
+| INFO | `signed out` | `user_id` |
+| INFO | `account updated` | `user_id`, `avatar_changed` |
+| INFO | `account deleted` | `user_id`, `routes` |
+| INFO | `route uploaded` | `route_id`, `user_id`, `visibility`, `points`, `segments`, `distance_m`, `hide_endpoints_m`, `photos` |
+| INFO | `route updated` | `route_id`, `user_id`, `visibility` |
+| INFO | `route deleted` | `route_id`, `user_id` |
+| INFO | `route downloaded` | `route_id`, `original` (served the original file), `counted` |
+| INFO | `route reported` | `report_id`, `route_id`, `reason`, `signed_in` |
+| INFO | `contributor badge changed` | `admin_id`, `user_id`, `verified` |
+| INFO | `report resolved` | `admin_id`, `report_id`, `route_id`, `action` |
+| WARN | `stored file not removed` | `key`, `error` |
+
+### Startup and background
+
+| Level | Message | Fields |
+| --- | --- | --- |
+| INFO | `configuration loaded` | `env`, `base_url`, `storage`, `email` (`brevo` or `log`), `custom_map_style` |
+| INFO | `Over There listening` | `addr` |
+| INFO | `route boxes backfilled` | `updated` |
+| INFO | `times removed from redacted GPX files` | `stripped` |
+| WARN | `redacted GPX unreadable` / `unparsable` / `not rewritten` | `key`, `error` |
+| INFO | `expired records purged` | `sessions`, `verifications`, `attempts` |
+| ERROR | `purging expired records failed` | `error` |

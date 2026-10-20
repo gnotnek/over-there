@@ -33,7 +33,12 @@ use std::{
     str::FromStr,
     sync::Arc,
 };
-use tower_http::{services::ServeDir, trace::TraceLayer};
+use tower_http::{
+    services::ServeDir,
+    trace::{DefaultOnResponse, TraceLayer},
+    LatencyUnit,
+};
+use tracing::Level;
 use uuid::Uuid;
 
 type WebResult = Result<Response, AppError>;
@@ -72,6 +77,10 @@ impl AppError {
 }
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
+        if self.0.is_client_error() {
+            // Messages are fixed user-facing text, so they carry no personal data.
+            tracing::info!(status = self.0.as_u16(), reason = %self.1, "request rejected");
+        }
         let escaped = escape(&self.1);
         (self.0, Html(format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Error · Over There</title><link rel=\"stylesheet\" href=\"/static/style.css\"><main class=\"error-page\"><a href=\"/\">Over There</a><h1>{escaped}</h1><p><a href=\"/explore\">Explore routes</a></p></main></html>"))).into_response()
     }
@@ -126,6 +135,7 @@ fn csrf(
     if auth::check_csrf(headers, val(form, "csrf"), &viewer.csrf, &state.base_url) {
         Ok(())
     } else {
+        tracing::warn!("csrf check failed");
         Err(AppError::forbidden())
     }
 }
@@ -302,6 +312,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if updated > 0 {
         tracing::info!(updated, "route boxes backfilled");
     }
+    let stripped = strip_redacted_times(&pool, &storage).await?;
+    if stripped > 0 {
+        tracing::info!(stripped, "times removed from redacted GPX files");
+    }
+    tokio::spawn(purge_every_hour(pool.clone()));
     let mut templates = Handlebars::new();
     handlebars::handlebars_helper!(eq: |a: str, b: str| a == b);
     templates.register_helper("eq", Box::new(eq));
@@ -325,6 +340,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             );
         }
     }
+    tracing::info!(
+        env = env::var("APP_ENV").as_deref().unwrap_or("development"),
+        %base_url,
+        storage = %storage.display(),
+        email = if brevo_api_key.is_some() { "brevo" } else { "log" },
+        custom_map_style = map_style != "/static/map-style.json",
+        "configuration loaded"
+    );
     let state = Arc::new(AppState {
         pool,
         templates,
@@ -341,6 +364,68 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!(%addr,"Over There listening");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn purge_every_hour(pool: SqlitePool) {
+    let mut tick = tokio::time::interval(std::time::Duration::from_secs(3600));
+    loop {
+        tick.tick().await;
+        match auth::purge_expired(&pool).await {
+            Ok(p) if p != auth::Purged::default() => tracing::info!(
+                sessions = p.sessions,
+                verifications = p.verifications,
+                attempts = p.attempts,
+                "expired records purged"
+            ),
+            Ok(_) => {}
+            Err(error) => tracing::error!(%error, "purging expired records failed"),
+        }
+    }
+}
+
+/// Rewrites redacted GPX files written before times were dropped from them. Idempotent.
+async fn strip_redacted_times(pool: &SqlitePool, storage: &FilePath) -> Result<u64, sqlx::Error> {
+    let keys: Vec<String> =
+        sqlx::query_scalar("SELECT public_gpx_key FROM routes WHERE public_gpx_key IS NOT NULL")
+            .fetch_all(pool)
+            .await?;
+    let mut stripped = 0;
+    for key in keys {
+        let path = storage.join(&key);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::warn!(%key, %error, "redacted GPX unreadable");
+                continue;
+            }
+        };
+        if !bytes.windows(6).any(|w| w == b"<time>") {
+            continue;
+        }
+        let segments = match gpx::parse(&bytes) {
+            Ok(parsed) => parsed.segments,
+            Err(error) => {
+                tracing::warn!(%key, %error, "redacted GPX unparsable");
+                continue;
+            }
+        };
+        match tokio::fs::write(&path, gpx::redacted_gpx(&segments)).await {
+            Ok(()) => stripped += 1,
+            Err(error) => tracing::warn!(%key, %error, "redacted GPX not rewritten"),
+        }
+    }
+    Ok(stripped)
+}
+
+/// Best-effort removal of stored files whose rows are already gone.
+async fn remove_assets(state: &AppState, keys: impl IntoIterator<Item = String>) {
+    for key in keys {
+        if let Err(error) = tokio::fs::remove_file(state.storage.join(&key)).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%key, %error, "stored file not removed");
+            }
+        }
+    }
 }
 
 fn router(state: Shared) -> Router {
@@ -365,15 +450,29 @@ fn router(state: Shared) -> Router {
         .route("/dashboard", get(dashboard))
         .route("/account", get(account_form).post(account_update))
         .route("/account/resend-verification", post(resend_verification))
+        .route("/account/delete", post(delete_account))
         .route("/admin", get(admin))
         .route("/admin/users/{id}/contributor", post(admin_contributor))
         .route("/admin/reports/{id}", post(admin_report))
         .nest_service("/static", ServeDir::new("static"))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         // Log the path only: query strings can carry a rider's rounded location.
-        .layer(TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<Body>| {
-            tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
-        }))
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(|req: &axum::http::Request<Body>| {
+                    tracing::info_span!(
+                        "request",
+                        id = %Uuid::new_v4().simple(),
+                        method = %req.method(),
+                        path = %req.uri().path(),
+                    )
+                })
+                .on_response(
+                    DefaultOnResponse::new()
+                        .level(Level::INFO)
+                        .latency_unit(LatencyUnit::Millis),
+                ),
+        )
         .with_state(state)
 }
 
@@ -549,11 +648,15 @@ async fn download(
     let bytes = tokio::fs::read(state.storage.join(key))
         .await
         .map_err(AppError::internal)?;
-    sqlx::query("UPDATE routes SET download_count=download_count+1 WHERE id=?")
-        .bind(&r.id)
-        .execute(&state.pool)
-        .await
-        .map_err(AppError::internal)?;
+    // Owners and admins fetching the original are not riders discovering the route.
+    if !owner {
+        sqlx::query("UPDATE routes SET download_count=download_count+1 WHERE id=?")
+            .bind(&r.id)
+            .execute(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    tracing::info!(route_id = %r.id, original = key == &r.gpx_key, counted = !owner, "route downloaded");
     let filename = format!("{}.gpx", r.slug);
     Ok((
         [
@@ -696,6 +799,7 @@ async fn register(
         let quota=sqlx::query("INSERT INTO email_send_quota(day,sent) VALUES (date('now'),1) ON CONFLICT(day) DO UPDATE SET sent=sent+1 WHERE sent<250")
             .execute(&mut *tx).await.map_err(AppError::internal)?;
         if quota.rows_affected() == 0 {
+            tracing::warn!("daily verification email quota reached");
             return Err(AppError(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Registration is temporarily full for today. Try again tomorrow".into(),
@@ -707,6 +811,7 @@ async fn register(
     let (token, _) = auth::create_session(&state.pool, &id)
         .await
         .map_err(AppError::internal)?;
+    tracing::info!(user_id = %id, "account registered");
     let mut response = msg_redirect("/dashboard", "Check your email to verify your address");
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -727,6 +832,7 @@ async fn send_verification(state: &AppState, email: &str, token: &str) -> Result
                 result.status()
             )));
         }
+        tracing::info!(provider = "brevo", "verification email sent");
     } else {
         tracing::warn!(%email,%link,"Development email verification link");
     }
@@ -757,6 +863,7 @@ async fn verify_email(State(state): State<Shared>, Path(token): Path<String>) ->
         .await
         .map_err(AppError::internal)?;
     tx.commit().await.map_err(AppError::internal)?;
+    tracing::info!(user_id = %id, "email verified");
     Ok(msg_redirect(
         "/dashboard",
         "Email verified. You can now share routes",
@@ -773,6 +880,7 @@ async fn login(
     let blocked:Option<i64>=sqlx::query_scalar("SELECT failures FROM auth_attempts WHERE email=? AND window_started_at>datetime('now','-15 minutes')")
         .bind(&email).fetch_optional(&state.pool).await.map_err(AppError::internal)?;
     if blocked.unwrap_or(0) >= 10 {
+        tracing::warn!("sign-in throttled");
         return Err(AppError(
             StatusCode::TOO_MANY_REQUESTS,
             "Too many sign-in attempts. Try again in 15 minutes".into(),
@@ -790,6 +898,7 @@ async fn login(
     if !valid {
         sqlx::query("INSERT INTO auth_attempts(email,failures,window_started_at) VALUES (?,1,datetime('now')) ON CONFLICT(email) DO UPDATE SET failures=CASE WHEN window_started_at<datetime('now','-15 minutes') THEN 1 ELSE failures+1 END,window_started_at=CASE WHEN window_started_at<datetime('now','-15 minutes') THEN datetime('now') ELSE window_started_at END")
             .bind(&email).execute(&state.pool).await.map_err(AppError::internal)?;
+        tracing::warn!(known_account = row.is_some(), "sign-in failed");
         return Err(AppError(
             StatusCode::UNAUTHORIZED,
             "Email or password is incorrect".into(),
@@ -804,6 +913,7 @@ async fn login(
     let (token, _) = auth::create_session(&state.pool, &id)
         .await
         .map_err(AppError::internal)?;
+    tracing::info!(user_id = %id, "signed in");
     let mut response = redirect("/dashboard");
     response.headers_mut().append(
         header::SET_COOKIE,
@@ -825,6 +935,9 @@ async fn logout(
             .execute(&state.pool)
             .await
             .map_err(AppError::internal)?;
+    }
+    if let Some(u) = &v.user {
+        tracing::info!(user_id = %u.id, "signed out");
     }
     let mut response = redirect("/");
     response.headers_mut().append(
@@ -982,16 +1095,10 @@ async fn upload(
         .bind(route_box.map(|b| b.min_lat)).bind(route_box.map(|b| b.max_lat)).bind(route_box.map(|b| b.min_lon)).bind(route_box.map(|b| b.max_lon))
         .execute(&mut *tx).await;
     if let Err(e) = result {
-        let _ = tokio::fs::remove_file(state.storage.join(gpx_key)).await;
-        if let Some(k) = public_gpx_key {
-            let _ = tokio::fs::remove_file(state.storage.join(k)).await;
-        }
-        if let Some(k) = cover_key {
-            let _ = tokio::fs::remove_file(state.storage.join(k)).await;
-        }
-        for key in photo_keys {
-            let _ = tokio::fs::remove_file(state.storage.join(key)).await;
-        }
+        let written = [Some(gpx_key), public_gpx_key, cover_key]
+            .into_iter()
+            .flatten();
+        remove_assets(&state, written.chain(photo_keys)).await;
         return Err(AppError::internal(e));
     }
     for (position, key) in photo_keys.iter().enumerate() {
@@ -1005,6 +1112,17 @@ async fn upload(
             .map_err(AppError::internal)?;
     }
     tx.commit().await.map_err(AppError::internal)?;
+    tracing::info!(
+        route_id = %id,
+        user_id = %user.id,
+        visibility = draft.visibility_str(),
+        points = parsed.segments.iter().map(Vec::len).sum::<usize>(),
+        segments = parsed.segments.len(),
+        distance_m = parsed.distance_m.round(),
+        hide_endpoints_m = hide,
+        photos = photo_keys.len(),
+        "route uploaded"
+    );
     Ok(redirect(&format!("/routes/{slug}")))
 }
 
@@ -1042,6 +1160,7 @@ async fn edit_route(
         .bind(&draft.region).bind(&draft.country).bind(&draft.difficulty)
         .bind(&draft.tags).bind(draft.visibility_str()).bind(&r.id)
         .execute(&state.pool).await.map_err(AppError::internal)?;
+    tracing::info!(route_id = %r.id, user_id = %user.id, visibility = draft.visibility_str(), "route updated");
     Ok(redirect(&format!("/routes/{slug}")))
 }
 async fn delete_route(
@@ -1068,15 +1187,11 @@ async fn delete_route(
         .execute(&state.pool)
         .await
         .map_err(AppError::internal)?;
-    for key in [Some(r.gpx_key), r.public_gpx_key, r.cover_key]
+    let files = [Some(r.gpx_key), r.public_gpx_key, r.cover_key]
         .into_iter()
-        .flatten()
-    {
-        let _ = tokio::fs::remove_file(state.storage.join(key)).await;
-    }
-    for key in photos {
-        let _ = tokio::fs::remove_file(state.storage.join(key)).await;
-    }
+        .flatten();
+    remove_assets(&state, files.chain(photos)).await;
+    tracing::info!(route_id = %r.id, user_id = %user.id, "route deleted");
     Ok(redirect("/dashboard"))
 }
 
@@ -1113,9 +1228,7 @@ async fn account_update(
             .execute(&state.pool)
             .await
             .map_err(AppError::internal)?;
-        if let Some(old) = &u.avatar_key {
-            let _ = tokio::fs::remove_file(state.storage.join(old)).await;
-        }
+        remove_assets(&state, u.avatar_key.clone()).await;
     } else {
         sqlx::query("UPDATE users SET bio=? WHERE id=?")
             .bind(bio)
@@ -1124,7 +1237,63 @@ async fn account_update(
             .await
             .map_err(AppError::internal)?;
     }
+    tracing::info!(user_id = %u.id, avatar_changed = avatar_key.is_some(), "account updated");
     Ok(msg_redirect("/account", "Account updated"))
+}
+
+async fn delete_account(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let u = require_user(&v)?;
+    csrf(&headers, &form, &v, &state)?;
+    let hash: String = sqlx::query_scalar("SELECT password_hash FROM users WHERE id=?")
+        .bind(&u.id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    if !auth::verify_password(val(&form, "password"), &hash) {
+        return Err(AppError(
+            StatusCode::UNAUTHORIZED,
+            "Password is incorrect".into(),
+        ));
+    }
+    let routes: Vec<(String, Option<String>, Option<String>)> =
+        sqlx::query_as("SELECT gpx_key,public_gpx_key,cover_key FROM routes WHERE author_id=?")
+            .bind(&u.id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    let photos: Vec<String> = sqlx::query_scalar(
+        "SELECT i.image_key FROM route_images i JOIN routes r ON r.id=i.route_id WHERE r.author_id=?",
+    )
+    .bind(&u.id)
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
+    // Cascades remove sessions, verification links, routes, their photos and reports.
+    sqlx::query("DELETE FROM users WHERE id=?")
+        .bind(&u.id)
+        .execute(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    let route_count = routes.len();
+    let files = routes
+        .into_iter()
+        .flat_map(|(gpx, public, cover)| [Some(gpx), public, cover])
+        .flatten()
+        .chain(photos)
+        .chain(u.avatar_key.clone());
+    remove_assets(&state, files).await;
+    tracing::info!(user_id = %u.id, routes = route_count, "account deleted");
+    let mut response = msg_redirect("/", "Your account was deleted");
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_static("ot_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    );
+    Ok(response)
 }
 
 async fn resend_verification(
@@ -1155,6 +1324,7 @@ async fn resend_verification(
         let quota=sqlx::query("INSERT INTO email_send_quota(day,sent) VALUES (date('now'),1) ON CONFLICT(day) DO UPDATE SET sent=sent+1 WHERE sent<250")
             .execute(&mut *tx).await.map_err(AppError::internal)?;
         if quota.rows_affected() == 0 {
+            tracing::warn!("daily verification email quota reached");
             return Err(AppError(
                 StatusCode::TOO_MANY_REQUESTS,
                 "Verification mail is temporarily full for today. Try again tomorrow".into(),
@@ -1175,6 +1345,7 @@ async fn resend_verification(
         .map_err(AppError::internal)?;
     send_verification(&state, &u.email, &token).await?;
     tx.commit().await.map_err(AppError::internal)?;
+    tracing::info!(user_id = %u.id, "verification link resent");
     Ok(msg_redirect("/account", "A new verification link was sent"))
 }
 
@@ -1198,10 +1369,11 @@ async fn report_route(
     if details.len() > 1000 {
         return Err(AppError::bad("Report details are too long"));
     }
+    let report_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO route_reports(id,route_id,reporter_id,reason,details) VALUES (?,?,?,?,?)",
     )
-    .bind(Uuid::new_v4().to_string())
+    .bind(&report_id)
     .bind(&r.id)
     .bind(v.user.as_ref().map(|u| u.id.as_str()))
     .bind(reason)
@@ -1209,6 +1381,7 @@ async fn report_route(
     .execute(&state.pool)
     .await
     .map_err(AppError::internal)?;
+    tracing::info!(%report_id, route_id = %r.id, reason, signed_in = v.user.is_some(), "route reported");
     Ok(msg_redirect(
         &format!("/routes/{slug}"),
         "Report received. Thank you",
@@ -1258,6 +1431,7 @@ async fn admin_contributor(
     let verified = val(&form, "verified") == "true";
     sqlx::query("UPDATE users SET contributor_verified_at=CASE WHEN ? THEN datetime('now') ELSE NULL END WHERE id=? AND email_verified_at IS NOT NULL")
         .bind(verified).bind(&id).execute(&state.pool).await.map_err(AppError::internal)?;
+    tracing::info!(admin_id = %u.id, user_id = %id, verified, "contributor badge changed");
     Ok(redirect("/admin"))
 }
 async fn admin_report(
@@ -1306,6 +1480,7 @@ async fn admin_report(
         }
         _ => return Err(AppError::bad("Unknown moderation action")),
     }
+    tracing::info!(admin_id = %u.id, report_id = %id, %route_id, action, "report resolved");
     Ok(redirect("/admin"))
 }
 
@@ -1643,6 +1818,128 @@ mod tests {
         let (stored, expected) = stored_box(&state).await;
         assert_eq!(stored, expected);
         assert_eq!(routes::backfill_route_boxes(&state.pool).await.unwrap(), 0);
+    }
+
+    async fn account_csrf(app: &Router, session: &str) -> String {
+        let page = send(app, "GET", "/account", Body::empty(), None, Some(session)).await;
+        assert_eq!(page.status(), StatusCode::OK);
+        field(&body_text(page).await, "csrf")
+    }
+
+    async fn count(state: &Shared, sql: &str) -> i64 {
+        sqlx::query_scalar(sql)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn account_deletion_needs_password_and_removes_routes_and_files() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let location =
+            upload_route(&app, &session, "Leaving Ride", TAIPEI_GPX, "public", "easy").await;
+        let csrf = account_csrf(&app, &session).await;
+        let delete = |password: &str| format!("csrf={csrf}&password={password}");
+        let form = Some("application/x-www-form-urlencoded");
+        let wrong = send(
+            &app,
+            "POST",
+            "/account/delete",
+            Body::from(delete("wrong")),
+            form,
+            Some(&session),
+        )
+        .await;
+        assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(count(&state, "SELECT count(*) FROM users").await, 1);
+        let right = send(
+            &app,
+            "POST",
+            "/account/delete",
+            Body::from(delete("a+very+long+test+password")),
+            form,
+            Some(&session),
+        )
+        .await;
+        assert_eq!(right.status(), StatusCode::SEE_OTHER);
+        assert_eq!(count(&state, "SELECT count(*) FROM users").await, 0);
+        assert_eq!(count(&state, "SELECT count(*) FROM routes").await, 0);
+        assert_eq!(count(&state, "SELECT count(*) FROM sessions").await, 0);
+        assert_eq!(std::fs::read_dir(&state.storage).unwrap().count(), 0);
+        let gone = send(&app, "GET", &location, Body::empty(), None, None).await;
+        assert_eq!(gone.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn owner_downloads_are_not_counted() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let location =
+            upload_route(&app, &session, "Counted Ride", TAIPEI_GPX, "public", "easy").await;
+        let download = format!("{location}/download");
+        let owner = send(&app, "GET", &download, Body::empty(), None, Some(&session)).await;
+        assert_eq!(owner.status(), StatusCode::OK);
+        assert_eq!(count(&state, "SELECT download_count FROM routes").await, 0);
+        let visitor = send(&app, "GET", &download, Body::empty(), None, None).await;
+        assert_eq!(visitor.status(), StatusCode::OK);
+        assert_eq!(count(&state, "SELECT download_count FROM routes").await, 1);
+    }
+
+    #[tokio::test]
+    async fn purge_removes_only_expired_records() {
+        let (app, state, _dir) = setup().await;
+        signed_in_rider(&app, &state).await;
+        for sql in [
+            "INSERT INTO sessions(token_hash,user_id,csrf_token,expires_at) SELECT 'old',id,'x',datetime('now','-1 day') FROM users",
+            "INSERT INTO email_verifications(token_hash,user_id,expires_at) SELECT 'old',id,datetime('now','-1 day') FROM users",
+            "INSERT INTO auth_attempts(email,failures,window_started_at) VALUES ('old@example.com',3,datetime('now','-1 hour')),('new@example.com',3,datetime('now'))",
+        ] {
+            sqlx::query(sql).execute(&state.pool).await.unwrap();
+        }
+        let purged = auth::purge_expired(&state.pool).await.unwrap();
+        assert_eq!(
+            purged,
+            auth::Purged {
+                sessions: 1,
+                verifications: 1,
+                attempts: 1
+            }
+        );
+        assert_eq!(count(&state, "SELECT count(*) FROM sessions").await, 1);
+        assert_eq!(
+            count(&state, "SELECT count(*) FROM email_verifications").await,
+            1
+        );
+        assert_eq!(count(&state, "SELECT count(*) FROM auth_attempts").await, 1);
+    }
+
+    #[tokio::test]
+    async fn startup_strips_times_from_old_redacted_files() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        upload_route(&app, &session, "Timed Ride", TAIPEI_GPX, "public", "easy").await;
+        let key: String = sqlx::query_scalar("SELECT public_gpx_key FROM routes")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let old = "<gpx><trk><trkseg><trkpt lat=\"25\" lon=\"121\"><time>2026-01-01T08:00:00Z</time></trkpt><trkpt lat=\"25.01\" lon=\"121.01\"><time>2026-01-01T08:05:00Z</time></trkpt></trkseg></trk></gpx>";
+        std::fs::write(state.storage.join(&key), old).unwrap();
+        assert_eq!(
+            strip_redacted_times(&state.pool, &state.storage)
+                .await
+                .unwrap(),
+            1
+        );
+        let rewritten = std::fs::read_to_string(state.storage.join(&key)).unwrap();
+        assert!(!rewritten.contains("<time>"));
+        assert!(rewritten.contains("lat=\"25.01\""));
+        assert_eq!(
+            strip_redacted_times(&state.pool, &state.storage)
+                .await
+                .unwrap(),
+            0
+        );
     }
 
     /// A synthetic ~1 km line heading north from (lat, lon).
