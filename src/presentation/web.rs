@@ -1526,4 +1526,10 @@ mod tests {
             assert!(ratio >= 4.5, "{fg} on {bg} is {ratio:.2}:1");
         }
     }
+
+    #[test]
+    fn focus_ring_wins_over_component_shadows() {
+        // .button, .route-card and the account pill set box-shadow at equal or higher specificity.
+        assert!(STYLE.contains(":focus-visible{outline:none;box-shadow:var(--ring)!important}"));
+    }
 }
