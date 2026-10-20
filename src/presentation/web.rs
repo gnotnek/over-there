@@ -316,6 +316,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if stripped > 0 {
         tracing::info!(stripped, "times removed from redacted GPX files");
     }
+    if let Some(updated) = recompute_climbing(&pool, &storage).await? {
+        tracing::info!(updated, "climbing recomputed");
+    }
     tokio::spawn(purge_every_hour(pool.clone()));
     let mut templates = Handlebars::new();
     handlebars::handlebars_helper!(eq: |a: str, b: str| a == b);
@@ -415,6 +418,49 @@ async fn strip_redacted_times(pool: &SqlitePool, storage: &FilePath) -> Result<u
         }
     }
     Ok(stripped)
+}
+
+/// Recounts climbing for every route from its original GPX, once, after the climbing rule changed.
+async fn recompute_climbing(
+    pool: &SqlitePool,
+    storage: &FilePath,
+) -> Result<Option<u64>, sqlx::Error> {
+    let pending: Option<String> =
+        sqlx::query_scalar("SELECT name FROM pending_tasks WHERE name='recompute_climbing'")
+            .fetch_optional(pool)
+            .await?;
+    if pending.is_none() {
+        return Ok(None);
+    }
+    let routes: Vec<(String, String)> = sqlx::query_as("SELECT id, gpx_key FROM routes")
+        .fetch_all(pool)
+        .await?;
+    let mut updated = 0;
+    for (id, key) in routes {
+        let parsed = match tokio::fs::read(storage.join(&key)).await {
+            Ok(bytes) => gpx::parse(&bytes),
+            Err(error) => Err(error.to_string()),
+        };
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tracing::warn!(route_id = %id, %error, "climbing not recomputed");
+                continue;
+            }
+        };
+        updated +=
+            sqlx::query("UPDATE routes SET elevation_gain_m=?, elevation_loss_m=? WHERE id=?")
+                .bind(parsed.gain_m)
+                .bind(parsed.loss_m)
+                .bind(&id)
+                .execute(pool)
+                .await?
+                .rows_affected();
+    }
+    sqlx::query("DELETE FROM pending_tasks WHERE name='recompute_climbing'")
+        .execute(pool)
+        .await?;
+    Ok(Some(updated))
 }
 
 /// Best-effort removal of stored files whose rows are already gone.
@@ -1939,6 +1985,55 @@ mod tests {
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_recomputes_climbing_once() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let good = upload_route(&app, &session, "Good Ride", TAIPEI_GPX, "public", "easy").await;
+        let gpx = line_gpx(26.0, 122.0);
+        let broken = upload_route(&app, &session, "Lost File", &gpx, "public", "easy").await;
+        let slug = |path: &str| path.trim_start_matches("/routes/").to_owned();
+        sqlx::query("UPDATE routes SET elevation_gain_m=0 WHERE slug=?")
+            .bind(slug(&good))
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let key: String = sqlx::query_scalar(
+            "UPDATE routes SET elevation_gain_m=99 WHERE slug=? RETURNING gpx_key",
+        )
+        .bind(slug(&broken))
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        std::fs::remove_file(state.storage.join(key)).unwrap();
+
+        assert_eq!(
+            recompute_climbing(&state.pool, &state.storage)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let gain = |s: String| {
+            let pool = state.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, f64>("SELECT elevation_gain_m FROM routes WHERE slug=?")
+                    .bind(s)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(gain(slug(&good)).await, 35.0);
+        assert_eq!(gain(slug(&broken)).await, 99.0);
+        assert_eq!(count(&state, "SELECT count(*) FROM pending_tasks").await, 0);
+        assert_eq!(
+            recompute_climbing(&state.pool, &state.storage)
+                .await
+                .unwrap(),
+            None
         );
     }
 

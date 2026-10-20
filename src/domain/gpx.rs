@@ -63,17 +63,21 @@ pub fn parse(bytes: &[u8]) -> Result<RouteData, String> {
     let mut loss = 0.0;
     let mut elevation_points = 0;
     for seg in &segments {
+        // Climbing is measured from a reference height that moves only after a change of
+        // more than 3 m, so GPS noise is ignored but a climb made of small steps still counts.
+        let mut reference = seg.iter().find_map(|p| p.ele);
         for pair in seg.windows(2) {
             distance_m += haversine(&pair[0], &pair[1]);
-            if let (Some(a), Some(b)) = (pair[0].ele, pair[1].ele) {
+            if pair[0].ele.is_some() && pair[1].ele.is_some() {
                 elevation_points += 1;
-                let change = b - a;
-                // A small deadband avoids counting meter-scale GPS noise as climbing.
-                if change > 3.0 {
-                    gain += change;
-                }
-                if change < -3.0 {
-                    loss -= change;
+            }
+            if let (Some(r), Some(e)) = (reference, pair[1].ele) {
+                if e - r > 3.0 {
+                    gain += e - r;
+                    reference = Some(e);
+                } else if r - e > 3.0 {
+                    loss += r - e;
+                    reference = Some(e);
                 }
             }
         }
@@ -303,6 +307,30 @@ mod tests {
         assert!(profile
             .iter()
             .all(|point| point.2 != 0.0 && point.2 != 0.04));
+    }
+    fn rte(eles: impl Iterator<Item = f64>) -> String {
+        let points: String = eles
+            .enumerate()
+            .map(|(i, e)| {
+                format!(
+                    "<rtept lat=\"0\" lon=\"{}\"><ele>{e}</ele></rtept>",
+                    i as f64 * 0.0005
+                )
+            })
+            .collect();
+        format!("<gpx><rte>{points}</rte></gpx>")
+    }
+    #[test]
+    fn gentle_climb_counts_in_full() {
+        let r = parse(rte((0..=40).map(f64::from)).as_bytes()).unwrap();
+        assert_eq!(r.gain_m, Some(40.0));
+        assert_eq!(r.loss_m, Some(0.0));
+    }
+    #[test]
+    fn small_noise_is_not_climbing() {
+        let r =
+            parse(rte((0..20).map(|i| if i % 2 == 0 { 10.0 } else { 12.0 })).as_bytes()).unwrap();
+        assert_eq!(r.gain_m, Some(0.0));
     }
     #[test]
     fn redacted_gpx_drops_times_and_keeps_elevation() {
