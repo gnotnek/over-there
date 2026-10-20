@@ -1,6 +1,6 @@
 # Contributing to Over There
 
-Thanks for helping riders find and share good routes. Open an issue before a large change so the product scope and domain rules are clear. Small bug fixes can go straight to a pull request.
+Thanks for helping riders find and share good routes. Have an idea, want to pick up a phase from the [roadmap](docs/roadmap.md), or disagree with something on it? [Open an issue](https://github.com/gnotnek/over-there/issues) and we can discuss it there. Open an issue before a large change so the product scope and domain rules are clear. Small bug fixes can go straight to a pull request.
 
 1. Read `docs/architecture.md` for domain boundaries and privacy rules.
 2. Run `cargo fmt --check`, `cargo test`, and `cargo check`.
