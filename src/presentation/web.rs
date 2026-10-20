@@ -1447,4 +1447,83 @@ mod tests {
             .unwrap();
         assert_eq!(bytes.as_ref(), gpx.as_bytes());
     }
+
+    const STYLE: &str = include_str!("../../static/style.css");
+
+    #[test]
+    fn stylesheet_colors_live_only_in_root_tokens() {
+        assert!(STYLE.starts_with(":root{"));
+        let rest = &STYLE[STYLE.find('}').unwrap()..];
+        // A color is # plus 3/4/6/8 hex digits; ids like #elevation-chart run on into a name.
+        let hex = rest.match_indices('#').find(|(i, _)| {
+            let after = &rest[i + 1..];
+            let n = after
+                .find(|c: char| !c.is_ascii_hexdigit())
+                .unwrap_or(after.len());
+            let next = after[n..].chars().next().unwrap_or(' ');
+            [3, 4, 6, 8].contains(&n) && !(next.is_alphanumeric() || next == '-' || next == '_')
+        });
+        assert!(
+            hex.is_none(),
+            "color literal outside :root near {:?}",
+            hex.map(|(i, _)| &rest[i..i + 12])
+        );
+        assert!(!rest.contains("rgb(") && !rest.contains("rgba("));
+        for file in [
+            include_str!("../../static/route.js"),
+            include_str!("../../templates/page.hbs"),
+        ] {
+            let file = file.to_ascii_uppercase();
+            for old in ["#006D77", "#83C5BE", "#EDF6F9", "#FFDDD2", "#E29578"] {
+                assert!(!file.contains(old), "old palette color {old} still used");
+            }
+        }
+    }
+
+    fn token(name: &str) -> [f64; 3] {
+        let root = &STYLE[..STYLE.find('}').unwrap()];
+        let at = root
+            .find(&format!("{name}:#"))
+            .unwrap_or_else(|| panic!("{name} missing"))
+            + name.len()
+            + 2;
+        let channel =
+            |i: usize| u8::from_str_radix(&root[at + i..at + i + 2], 16).unwrap() as f64 / 255.0;
+        [channel(0), channel(2), channel(4)]
+    }
+
+    fn contrast(a: [f64; 3], b: [f64; 3]) -> f64 {
+        let luminance = |c: [f64; 3]| {
+            let l = c.map(|v| {
+                if v <= 0.04045 {
+                    v / 12.92
+                } else {
+                    ((v + 0.055) / 1.055).powf(2.4)
+                }
+            });
+            0.2126 * l[0] + 0.7152 * l[1] + 0.0722 * l[2]
+        };
+        let (x, y) = (luminance(a), luminance(b));
+        (x.max(y) + 0.05) / (x.min(y) + 0.05)
+    }
+
+    #[test]
+    fn palette_token_pairs_meet_wcag_aa() {
+        assert!((contrast([0.0; 3], [1.0; 3]) - 21.0).abs() < 0.01);
+        let pairs = [
+            ("--black", "--bg"),
+            ("--black", "--white"),
+            ("--muted", "--white"),
+            ("--muted", "--bg"),
+            ("--black", "--lime"),
+            ("--white", "--black"),
+            ("--lime", "--black"),
+            ("--danger", "--white"),
+            ("--white", "--charcoal"),
+        ];
+        for (fg, bg) in pairs {
+            let ratio = contrast(token(fg), token(bg));
+            assert!(ratio >= 4.5, "{fg} on {bg} is {ratio:.2}:1");
+        }
+    }
 }

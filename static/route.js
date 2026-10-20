@@ -17,8 +17,8 @@
       map.on('load', () => {
         element.querySelector('.map-fallback')?.remove();
         map.addSource('route', {type: 'geojson', data: {type: 'Feature', properties: {}, geometry}});
-        map.addLayer({id: 'route-casing', type: 'line', source: 'route', paint: {'line-color': '#006D77', 'line-width': 9, 'line-opacity': .96}, layout: {'line-join': 'round', 'line-cap': 'round'}});
-        map.addLayer({id: 'route-line', type: 'line', source: 'route', paint: {'line-color': '#FFDDD2', 'line-width': 5}, layout: {'line-join': 'round', 'line-cap': 'round'}});
+        map.addLayer({id: 'route-casing', type: 'line', source: 'route', paint: {'line-color': '#C6FF2D', 'line-width': 9, 'line-opacity': .96}, layout: {'line-join': 'round', 'line-cap': 'round'}});
+        map.addLayer({id: 'route-line', type: 'line', source: 'route', paint: {'line-color': '#0F0F0F', 'line-width': 5}, layout: {'line-join': 'round', 'line-cap': 'round'}});
         const points = lines.flat();
         const bounds = new maplibregl.LngLatBounds(points[0], points[0]);
         points.forEach(point => bounds.extend(point));
@@ -44,7 +44,7 @@
       const yRange = Math.max(1, maxY - minY);
       const coordinates = sampled.map(point => [inset + (point[0] / maxX) * (w - 2 * inset), h - inset - ((point[1] - minY) / yRange) * (h - 2 * inset)]);
       const path = coordinates.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`).join(' ');
-      chart.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Elevation from ${Math.round(minY)} to ${Math.round(maxY)} metres"><path d="${path} L${w-inset},${h} L${inset},${h} Z" fill="#83C5BE"/><path d="${path}" fill="none" stroke="#006D77" stroke-width="3" vector-effect="non-scaling-stroke"/><line id="elevation-cursor" x1="0" x2="0" y1="0" y2="${h}" stroke="#E29578" stroke-width="2" opacity="0"/></svg><div class="chart-readout" aria-live="polite"></div>`;
+      chart.innerHTML = `<svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Elevation from ${Math.round(minY)} to ${Math.round(maxY)} metres"><path d="${path} L${w-inset},${h} L${inset},${h} Z" fill="#F1FFD0"/><path d="${path}" fill="none" stroke="#0F0F0F" stroke-width="3" vector-effect="non-scaling-stroke"/><line id="elevation-cursor" x1="0" x2="0" y1="0" y2="${h}" stroke="#2F2F2F" stroke-width="2" opacity="0"/></svg><div class="chart-readout" aria-live="polite"></div>`;
       chart.addEventListener('pointermove', event => {
         const rect = chart.getBoundingClientRect();
         const distance = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width)) * maxX;
