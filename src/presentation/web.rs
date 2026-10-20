@@ -495,6 +495,7 @@ fn router(state: Shared) -> Router {
         .route("/routes/{slug}/cover", get(route_cover))
         .route("/routes/{slug}/images/{id}", get(route_image))
         .route("/routes/{slug}/edit", get(edit_form).post(edit_route))
+        .route("/routes/{slug}/line", get(line_form).post(save_line))
         .route("/routes/{slug}/delete", post(delete_route))
         .route("/routes/{slug}/report", post(report_route))
         .route("/users/{username}", get(profile))
@@ -1210,7 +1211,118 @@ async fn edit_form(
     }
     let mut data = base_context(&state, &v, "Edit route", "edit");
     data["route"] = route_json(&r);
+    data["has_plan"] = json!(r.plan_json.is_some());
     render(&state, v, data)
+}
+/// Loads a drawn route for its owner's line editor; uploaded routes have no plan and no editor.
+async fn drawn_route_for_owner(
+    state: &AppState,
+    user: &User,
+    slug: &str,
+) -> Result<(RouteRecord, String), AppError> {
+    let r = get_route(&state.pool, slug).await?;
+    if !can_edit(&r, user) {
+        return Err(AppError::forbidden());
+    }
+    let plan = r.plan_json.clone().ok_or_else(AppError::not_found)?;
+    Ok((r, plan))
+}
+async fn line_form(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    let (r, plan) = drawn_route_for_owner(&state, user, &slug).await?;
+    let raw = tokio::fs::read(state.storage.join(&r.gpx_key))
+        .await
+        .map_err(AppError::internal)?;
+    let parsed = gpx::parse(&raw).map_err(AppError::internal)?;
+    let line: Vec<Vec<f64>> = parsed
+        .segments
+        .iter()
+        .flatten()
+        .map(|p| [p.lon, p.lat].into_iter().chain(p.ele).collect())
+        .collect();
+    let mut data = base_context(&state, &v, "Edit the line", "line");
+    data["route"] = route_json(&r);
+    data["routing_url"] = json!(state.routing_url);
+    data["cycling_type"] = json!(r.cycling_type);
+    data["line_json"] = json!(serde_json::to_string(&line).unwrap());
+    data["plan_json"] = json!(plan);
+    render(&state, v, data)
+}
+async fn save_line(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    multipart: Multipart,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    let (form, mut files) = multipart_values(multipart).await?;
+    csrf(&headers, &form, &v, &state)?;
+    let (r, _) = drawn_route_for_owner(&state, user, &slug).await?;
+    let (line, plan) = match (files.remove("line"), files.remove("plan")) {
+        (Some(line), Some(plan)) => (line, plan),
+        _ => return Err(AppError::bad("Draw at least two points")),
+    };
+    let (raw, plan) = gpx::drawn_route(&line, &plan).map_err(AppError::bad)?;
+    let parsed = gpx::parse(&raw).map_err(AppError::bad)?;
+    let sha = format!("{:x}", Sha256::digest(&raw));
+    let duplicate: Option<String> = sqlx::query_scalar(
+        "SELECT slug FROM routes WHERE author_id=? AND gpx_sha256=? AND id<>? LIMIT 1",
+    )
+    .bind(&r.author_id)
+    .bind(&sha)
+    .bind(&r.id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
+    if duplicate.is_some() {
+        return Err(AppError::bad("You already uploaded this GPX file"));
+    }
+    let public_segments =
+        gpx::public_segments(&parsed.segments, r.hide_endpoints_m).map_err(AppError::bad)?;
+    let geometry = gpx::geojson(&public_segments);
+    let route_box = nearby::bbox(&geometry);
+    let elevation = gpx::elevation_profile(&public_segments)
+        .as_ref()
+        .map(|e| serde_json::to_string(e).unwrap());
+    let gpx_key = write_asset(&state, &raw, "gpx").await?;
+    let public_gpx_key = if r.hide_endpoints_m > 0.0 {
+        Some(write_asset(&state, &gpx::redacted_gpx(&public_segments), "gpx").await?)
+    } else {
+        None
+    };
+    let result = sqlx::query("UPDATE routes SET gpx_key=?,public_gpx_key=?,gpx_sha256=?,geometry_json=?,elevation_json=?,distance_m=?,elevation_gain_m=?,elevation_loss_m=?,duration_s=NULL,min_lat=?,max_lat=?,min_lon=?,max_lon=?,plan_json=?,updated_at=datetime('now') WHERE id=?")
+        .bind(&gpx_key).bind(&public_gpx_key).bind(&sha).bind(&geometry).bind(&elevation)
+        .bind(parsed.distance_m).bind(parsed.gain_m).bind(parsed.loss_m)
+        .bind(route_box.map(|b| b.min_lat)).bind(route_box.map(|b| b.max_lat)).bind(route_box.map(|b| b.min_lon)).bind(route_box.map(|b| b.max_lon))
+        .bind(&plan).bind(&r.id)
+        .execute(&state.pool).await;
+    if let Err(e) = result {
+        remove_assets(
+            &state,
+            [Some(gpx_key), public_gpx_key].into_iter().flatten(),
+        )
+        .await;
+        return Err(AppError::internal(e));
+    }
+    remove_assets(
+        &state,
+        [Some(r.gpx_key), r.public_gpx_key].into_iter().flatten(),
+    )
+    .await;
+    tracing::info!(
+        route_id = %r.id,
+        user_id = %user.id,
+        points = parsed.segments.iter().map(Vec::len).sum::<usize>(),
+        distance_m = parsed.distance_m.round(),
+        "route line updated"
+    );
+    Ok(redirect(&format!("/routes/{slug}")))
 }
 async fn edit_route(
     State(state): State<Shared>,
@@ -1636,6 +1748,9 @@ mod tests {
     }
 
     async fn signed_in_rider(app: &Router, state: &Shared) -> String {
+        signed_in_as(app, state, "test_rider").await
+    }
+    async fn signed_in_as(app: &Router, state: &Shared, username: &str) -> String {
         let register = send(app, "GET", "/register", Body::empty(), None, None).await;
         assert_eq!(register.status(), StatusCode::OK);
         let cookie = register.headers()[header::SET_COOKIE]
@@ -1646,7 +1761,7 @@ mod tests {
             .unwrap()
             .to_owned();
         let csrf = field(&body_text(register).await, "csrf");
-        let form = format!("csrf={csrf}&username=test_rider&email=test%40example.com&password=a+very+long+test+password");
+        let form = format!("csrf={csrf}&username={username}&email={username}%40example.com&password=a+very+long+test+password");
         let registered = send(
             app,
             "POST",
@@ -1664,12 +1779,11 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
-        sqlx::query(
-            "UPDATE users SET email_verified_at=datetime('now') WHERE username='test_rider'",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap();
+        sqlx::query("UPDATE users SET email_verified_at=datetime('now') WHERE username=?")
+            .bind(username)
+            .execute(&state.pool)
+            .await
+            .unwrap();
         session
     }
 
@@ -2170,6 +2284,103 @@ mod tests {
                 !body.contains("25.0]") && !body.contains("25.0,") && !body.contains("121,25]")
             );
         }
+    }
+
+    async fn post_line(
+        app: &Router,
+        session: &str,
+        slug: &str,
+        line: &str,
+        plan: &str,
+    ) -> Response {
+        let page = send(app, "GET", "/upload", Body::empty(), None, Some(session)).await;
+        let csrf = field(&body_text(page).await, "csrf");
+        let multipart = format!("--b\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n{csrf}\r\n--b\r\nContent-Disposition: form-data; name=\"line\"; filename=\"line.json\"\r\n\r\n{line}\r\n--b\r\nContent-Disposition: form-data; name=\"plan\"; filename=\"plan.json\"\r\n\r\n{plan}\r\n--b--\r\n");
+        send(
+            app,
+            "POST",
+            &format!("/routes/{slug}/line"),
+            Body::from(multipart),
+            Some("multipart/form-data; boundary=b"),
+            Some(session),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn owner_redraws_line() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let location = draw_route(&app, &session, "Redrawn Ride", "0").await;
+        let slug = location.trim_start_matches("/routes/");
+        let editor = send(
+            &app,
+            "GET",
+            &format!("{location}/line"),
+            Body::empty(),
+            None,
+            Some(&session),
+        )
+        .await;
+        assert_eq!(editor.status(), StatusCode::OK);
+        assert!(body_text(editor).await.contains("&quot;points&quot;"));
+        let before: (String, f64) =
+            sqlx::query_as("SELECT gpx_key, distance_m FROM routes WHERE slug=?")
+                .bind(slug)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let line = "[[121,25,5],[121,25.01,9],[121,25.02,30],[121,25.04,12]]";
+        let plan = r#"{"points":[[121,25],[121,25.04]],"at":[0,3],"straight":[true]}"#;
+        let saved = post_line(&app, &session, slug, line, plan).await;
+        assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+        assert_eq!(saved.headers()[header::LOCATION], location.as_str());
+        let after: (String, f64) =
+            sqlx::query_as("SELECT gpx_key, distance_m FROM routes WHERE slug=?")
+                .bind(slug)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(after.1 > before.1);
+        assert_ne!(after.0, before.0);
+        assert!(!state.storage.join(&before.0).exists());
+        let again = post_line(&app, &session, slug, line, plan).await;
+        assert_eq!(again.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn line_editor_access() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_rider(&app, &state).await;
+        let drawn = draw_route(&app, &owner, "Owner Drawn", "0").await;
+        let uploaded =
+            upload_route(&app, &owner, "Owner Uploaded", TAIPEI_GPX, "public", "easy").await;
+        let other = signed_in_as(&app, &state, "other_rider").await;
+        let get = |path: String, session: String| {
+            let app = app.clone();
+            async move { send(&app, "GET", &path, Body::empty(), None, Some(&session)).await }
+        };
+        assert_eq!(
+            get(format!("{drawn}/line"), other.clone()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let slug = drawn.trim_start_matches("/routes/");
+        assert_eq!(
+            post_line(&app, &other, slug, DRAWN_LINE, DRAWN_PLAN)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(format!("{uploaded}/line"), owner.clone())
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let drawn_edit = body_text(get(format!("{drawn}/edit"), owner.clone()).await).await;
+        assert!(drawn_edit.contains("Edit the line"));
+        let uploaded_edit = body_text(get(format!("{uploaded}/edit"), owner.clone()).await).await;
+        assert!(!uploaded_edit.contains("Edit the line"));
     }
 
     #[tokio::test]
