@@ -1755,5 +1755,6 @@ mod tests {
         }
         assert!(!body.contains("km away"));
         assert!(body.contains("name=\"near\" value=\"10,20\""));
+        assert!(body.contains("<option value=\"newest\" selected>"));
     }
 }
