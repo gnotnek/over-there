@@ -49,6 +49,7 @@ struct AppState {
     storage: PathBuf,
     base_url: String,
     map_style: String,
+    routing_url: String,
     secure_cookie: bool,
     brevo_api_key: Option<String>,
     mail_from: Option<String>,
@@ -333,6 +334,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     if stripped > 0 {
         tracing::info!(stripped, "times removed from redacted GPX files");
     }
+    if let Some(updated) = recompute_climbing(&pool, &storage).await? {
+        tracing::info!(updated, "climbing recomputed");
+    }
     tokio::spawn(purge_every_hour(pool.clone()));
     let mut templates = Handlebars::new();
     handlebars::handlebars_helper!(eq: |a: str, b: str| a == b);
@@ -343,6 +347,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .trim_end_matches('/')
         .to_owned();
     let map_style = env::var("MAP_STYLE_URL").unwrap_or_else(|_| "/static/map-style.json".into());
+    let routing_url =
+        env::var("ROUTING_URL").unwrap_or_else(|_| "https://brouter.de/brouter".into());
     let brevo_api_key = env::var("BREVO_API_KEY").ok();
     let mail_from = env::var("MAIL_FROM").ok();
     if env::var("APP_ENV").as_deref() == Ok("production") {
@@ -363,6 +369,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         storage = %storage.display(),
         email = if brevo_api_key.is_some() { "brevo" } else { "log" },
         custom_map_style = map_style != "/static/map-style.json",
+        %routing_url,
         "configuration loaded"
     );
     let state = Arc::new(AppState {
@@ -372,6 +379,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         secure_cookie: base_url.starts_with("https://"),
         base_url,
         map_style,
+        routing_url,
         brevo_api_key,
         mail_from,
     });
@@ -434,6 +442,49 @@ async fn strip_redacted_times(pool: &SqlitePool, storage: &FilePath) -> Result<u
     Ok(stripped)
 }
 
+/// Recounts climbing for every route from its original GPX, once, after the climbing rule changed.
+async fn recompute_climbing(
+    pool: &SqlitePool,
+    storage: &FilePath,
+) -> Result<Option<u64>, sqlx::Error> {
+    let pending: Option<String> =
+        sqlx::query_scalar("SELECT name FROM pending_tasks WHERE name='recompute_climbing'")
+            .fetch_optional(pool)
+            .await?;
+    if pending.is_none() {
+        return Ok(None);
+    }
+    let routes: Vec<(String, String)> = sqlx::query_as("SELECT id, gpx_key FROM routes")
+        .fetch_all(pool)
+        .await?;
+    let mut updated = 0;
+    for (id, key) in routes {
+        let parsed = match tokio::fs::read(storage.join(&key)).await {
+            Ok(bytes) => gpx::parse(&bytes),
+            Err(error) => Err(error.to_string()),
+        };
+        let parsed = match parsed {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                tracing::warn!(route_id = %id, %error, "climbing not recomputed");
+                continue;
+            }
+        };
+        updated +=
+            sqlx::query("UPDATE routes SET elevation_gain_m=?, elevation_loss_m=? WHERE id=?")
+                .bind(parsed.gain_m)
+                .bind(parsed.loss_m)
+                .bind(&id)
+                .execute(pool)
+                .await?
+                .rows_affected();
+    }
+    sqlx::query("DELETE FROM pending_tasks WHERE name='recompute_climbing'")
+        .execute(pool)
+        .await?;
+    Ok(Some(updated))
+}
+
 /// Best-effort removal of stored files whose rows are already gone.
 async fn remove_assets(state: &AppState, keys: impl IntoIterator<Item = String>) {
     for key in keys {
@@ -454,12 +505,14 @@ fn router(state: Shared) -> Router {
         .route("/logout", post(logout))
         .route("/verify/{token}", get(verify_email))
         .route("/upload", get(upload_form).post(upload))
+        .route("/routes/new", get(draw_form))
         .route("/routes/{slug}", get(route_detail))
         .route("/routes/{slug}/geometry", get(route_geometry))
         .route("/routes/{slug}/download", get(download))
         .route("/routes/{slug}/cover", get(route_cover))
         .route("/routes/{slug}/images/{id}", get(route_image))
         .route("/routes/{slug}/edit", get(edit_form).post(edit_route))
+        .route("/routes/{slug}/line", get(line_form).post(save_line))
         .route("/routes/{slug}/delete", post(delete_route))
         .route("/routes/{slug}/report", post(report_route))
         .route("/users/{username}", get(profile))
@@ -995,6 +1048,14 @@ async fn upload_form(State(state): State<Shared>, headers: HeaderMap) -> WebResu
     let data = base_context(&state, &v, "Share a route", "upload");
     render(&state, v, data)
 }
+async fn draw_form(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    require_user(&v)?;
+    let mut data = base_context(&state, &v, "Draw a route", "upload");
+    data["draw"] = json!(true);
+    data["routing_url"] = json!(state.routing_url);
+    render(&state, v, data)
+}
 async fn multipart_values(
     mut multipart: Multipart,
 ) -> Result<(HashMap<String, String>, HashMap<String, Vec<u8>>), AppError> {
@@ -1076,9 +1137,19 @@ async fn upload(
         }
     }
     let draft = RouteDraft::from_fields(&form).map_err(AppError::bad)?;
-    let raw = files
-        .remove("gpx")
-        .ok_or_else(|| AppError::bad("Choose a GPX file"))?;
+    let (raw, plan) = match (files.remove("line"), files.remove("plan")) {
+        (Some(line), Some(plan)) => {
+            let (raw, plan) = gpx::drawn_route(&line, &plan).map_err(AppError::bad)?;
+            (raw, Some(plan))
+        }
+        (None, None) => (
+            files
+                .remove("gpx")
+                .ok_or_else(|| AppError::bad("Choose a GPX file"))?,
+            None,
+        ),
+        _ => return Err(AppError::bad("Draw at least two points")),
+    };
     let parsed = gpx::parse(&raw).map_err(AppError::bad)?;
     let sha = format!("{:x}", Sha256::digest(&raw));
     let duplicate: Option<String> =
@@ -1123,13 +1194,14 @@ async fn upload(
         .as_ref()
         .map(|e| serde_json::to_string(e).unwrap());
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
-    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon) SELECT ?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ? OR (SELECT count(*) FROM routes WHERE author_id=? AND created_at>datetime('now','-1 day'))<?")
+    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon,plan_json) SELECT ?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ? OR (SELECT count(*) FROM routes WHERE author_id=? AND created_at>datetime('now','-1 day'))<?")
         .bind(&id).bind(&user.id).bind(&slug).bind(&draft.title).bind(&draft.description)
         .bind(&draft.cycling_type).bind(&draft.region).bind(&draft.country)
         .bind(&draft.difficulty).bind(&draft.tags).bind(draft.visibility_str())
         .bind(&gpx_key).bind(&public_gpx_key).bind(&sha).bind(hide).bind(&geometry).bind(&elevation)
         .bind(parsed.distance_m).bind(parsed.gain_m).bind(parsed.loss_m).bind(parsed.duration_s).bind(&cover_key)
         .bind(route_box.map(|b| b.min_lat)).bind(route_box.map(|b| b.max_lat)).bind(route_box.map(|b| b.min_lon)).bind(route_box.map(|b| b.max_lon))
+        .bind(&plan)
         .bind(verified).bind(&user.id).bind(UNVERIFIED_DAILY_ROUTES)
         .execute(&mut *tx).await;
     if !matches!(result, Ok(ref done) if done.rows_affected() == 1) {
@@ -1162,6 +1234,7 @@ async fn upload(
         distance_m = parsed.distance_m.round(),
         hide_endpoints_m = hide,
         photos = photo_keys.len(),
+        drawn = plan.is_some(),
         "route uploaded"
     );
     Ok(redirect(&format!("/routes/{slug}")))
@@ -1180,7 +1253,118 @@ async fn edit_form(
     }
     let mut data = base_context(&state, &v, "Edit route", "edit");
     data["route"] = route_json(&r);
+    data["has_plan"] = json!(r.plan_json.is_some());
     render(&state, v, data)
+}
+/// Loads a drawn route for its owner's line editor; uploaded routes have no plan and no editor.
+async fn drawn_route_for_owner(
+    state: &AppState,
+    user: &User,
+    slug: &str,
+) -> Result<(RouteRecord, String), AppError> {
+    let r = get_route(&state.pool, slug).await?;
+    if !can_edit(&r, user) {
+        return Err(AppError::forbidden());
+    }
+    let plan = r.plan_json.clone().ok_or_else(AppError::not_found)?;
+    Ok((r, plan))
+}
+async fn line_form(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    let (r, plan) = drawn_route_for_owner(&state, user, &slug).await?;
+    let raw = tokio::fs::read(state.storage.join(&r.gpx_key))
+        .await
+        .map_err(AppError::internal)?;
+    let parsed = gpx::parse(&raw).map_err(AppError::internal)?;
+    let line: Vec<Vec<f64>> = parsed
+        .segments
+        .iter()
+        .flatten()
+        .map(|p| [p.lon, p.lat].into_iter().chain(p.ele).collect())
+        .collect();
+    let mut data = base_context(&state, &v, "Edit the line", "line");
+    data["route"] = route_json(&r);
+    data["routing_url"] = json!(state.routing_url);
+    data["cycling_type"] = json!(r.cycling_type);
+    data["line_json"] = json!(serde_json::to_string(&line).unwrap());
+    data["plan_json"] = json!(plan);
+    render(&state, v, data)
+}
+async fn save_line(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    multipart: Multipart,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    let (form, mut files) = multipart_values(multipart).await?;
+    csrf(&headers, &form, &v, &state)?;
+    let (r, _) = drawn_route_for_owner(&state, user, &slug).await?;
+    let (line, plan) = match (files.remove("line"), files.remove("plan")) {
+        (Some(line), Some(plan)) => (line, plan),
+        _ => return Err(AppError::bad("Draw at least two points")),
+    };
+    let (raw, plan) = gpx::drawn_route(&line, &plan).map_err(AppError::bad)?;
+    let parsed = gpx::parse(&raw).map_err(AppError::bad)?;
+    let sha = format!("{:x}", Sha256::digest(&raw));
+    let duplicate: Option<String> = sqlx::query_scalar(
+        "SELECT slug FROM routes WHERE author_id=? AND gpx_sha256=? AND id<>? LIMIT 1",
+    )
+    .bind(&r.author_id)
+    .bind(&sha)
+    .bind(&r.id)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
+    if duplicate.is_some() {
+        return Err(AppError::bad("You already uploaded this GPX file"));
+    }
+    let public_segments =
+        gpx::public_segments(&parsed.segments, r.hide_endpoints_m).map_err(AppError::bad)?;
+    let geometry = gpx::geojson(&public_segments);
+    let route_box = nearby::bbox(&geometry);
+    let elevation = gpx::elevation_profile(&public_segments)
+        .as_ref()
+        .map(|e| serde_json::to_string(e).unwrap());
+    let gpx_key = write_asset(&state, &raw, "gpx").await?;
+    let public_gpx_key = if r.hide_endpoints_m > 0.0 {
+        Some(write_asset(&state, &gpx::redacted_gpx(&public_segments), "gpx").await?)
+    } else {
+        None
+    };
+    let result = sqlx::query("UPDATE routes SET gpx_key=?,public_gpx_key=?,gpx_sha256=?,geometry_json=?,elevation_json=?,distance_m=?,elevation_gain_m=?,elevation_loss_m=?,duration_s=NULL,min_lat=?,max_lat=?,min_lon=?,max_lon=?,plan_json=?,updated_at=datetime('now') WHERE id=?")
+        .bind(&gpx_key).bind(&public_gpx_key).bind(&sha).bind(&geometry).bind(&elevation)
+        .bind(parsed.distance_m).bind(parsed.gain_m).bind(parsed.loss_m)
+        .bind(route_box.map(|b| b.min_lat)).bind(route_box.map(|b| b.max_lat)).bind(route_box.map(|b| b.min_lon)).bind(route_box.map(|b| b.max_lon))
+        .bind(&plan).bind(&r.id)
+        .execute(&state.pool).await;
+    if let Err(e) = result {
+        remove_assets(
+            &state,
+            [Some(gpx_key), public_gpx_key].into_iter().flatten(),
+        )
+        .await;
+        return Err(AppError::internal(e));
+    }
+    remove_assets(
+        &state,
+        [Some(r.gpx_key), r.public_gpx_key].into_iter().flatten(),
+    )
+    .await;
+    tracing::info!(
+        route_id = %r.id,
+        user_id = %user.id,
+        points = parsed.segments.iter().map(Vec::len).sum::<usize>(),
+        distance_m = parsed.distance_m.round(),
+        "route line updated"
+    );
+    Ok(redirect(&format!("/routes/{slug}")))
 }
 async fn edit_route(
     State(state): State<Shared>,
@@ -1562,6 +1746,7 @@ mod tests {
             storage,
             base_url: "http://localhost".into(),
             map_style: "/static/map-style.json".into(),
+            routing_url: "https://brouter.de/brouter".into(),
             secure_cookie: false,
             brevo_api_key,
             mail_from: None,
@@ -1608,17 +1793,27 @@ mod tests {
     }
 
     async fn signed_in_rider(app: &Router, state: &Shared) -> String {
-        let session = unverified_rider(app).await;
-        sqlx::query(
-            "UPDATE users SET email_verified_at=datetime('now') WHERE username='test_rider'",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap();
+        signed_in_as(app, state, "test_rider").await
+    }
+    async fn signed_in_as(app: &Router, state: &Shared, username: &str) -> String {
+        let registered = register_rider(app, username, "").await;
+        assert_eq!(registered.status(), StatusCode::SEE_OTHER);
+        let session = registered.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        sqlx::query("UPDATE users SET email_verified_at=datetime('now') WHERE username=?")
+            .bind(username)
+            .execute(&state.pool)
+            .await
+            .unwrap();
         session
     }
 
-    async fn register_rider(app: &Router, extra: &str) -> Response {
+    async fn register_rider(app: &Router, username: &str, extra: &str) -> Response {
         let register = send(app, "GET", "/register", Body::empty(), None, None).await;
         assert_eq!(register.status(), StatusCode::OK);
         let cookie = register.headers()[header::SET_COOKIE]
@@ -1629,7 +1824,7 @@ mod tests {
             .unwrap()
             .to_owned();
         let csrf = field(&body_text(register).await, "csrf");
-        let form = format!("csrf={csrf}&username=test_rider&email=test%40example.com&password=a+very+long+test+password{extra}");
+        let form = format!("csrf={csrf}&username={username}&email={username}%40example.com&password=a+very+long+test+password{extra}");
         send(
             app,
             "POST",
@@ -1642,7 +1837,7 @@ mod tests {
     }
 
     async fn unverified_rider(app: &Router) -> String {
-        let registered = register_rider(app, "").await;
+        let registered = register_rider(app, "test_rider", "").await;
         assert_eq!(registered.status(), StatusCode::SEE_OTHER);
         registered.headers()[header::SET_COOKIE]
             .to_str()
@@ -1761,7 +1956,7 @@ mod tests {
     #[tokio::test]
     async fn honeypot_rejects_register_and_upload() {
         let (app, state, _dir) = setup().await;
-        let bot = register_rider(&app, "&website=spam.example").await;
+        let bot = register_rider(&app, "test_rider", "&website=spam.example").await;
         assert_eq!(bot.status(), StatusCode::BAD_REQUEST);
         assert_eq!(count(&state, "SELECT count(*) FROM users").await, 0);
         let session = unverified_rider(&app).await;
@@ -2083,6 +2278,345 @@ mod tests {
                 .await
                 .unwrap(),
             0
+        );
+    }
+
+    const DRAWN_LINE: &str = "[[121,25,5],[121,25.01,9],[121,25.02,30]]";
+    const DRAWN_PLAN: &str = r#"{"points":[[121,25],[121,25.02]],"at":[0,2],"straight":[false]}"#;
+
+    /// Posts a drawn route; `files` are (field name, JSON) parts sent as files.
+    async fn post_drawn(
+        app: &Router,
+        session: &str,
+        title: &str,
+        files: &[(&str, &str)],
+        hide: &str,
+    ) -> Response {
+        let page = send(
+            app,
+            "GET",
+            "/routes/new",
+            Body::empty(),
+            None,
+            Some(session),
+        )
+        .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let csrf = field(&body_text(page).await, "csrf");
+        let mut multipart = String::new();
+        for (k, value) in [
+            ("csrf", csrf.as_str()),
+            ("title", title),
+            ("description", ""),
+            ("cycling_type", "road"),
+            ("region", "Taipei"),
+            ("country", "Taiwan"),
+            ("difficulty", "easy"),
+            ("tags", ""),
+            ("visibility", "public"),
+            ("hide_endpoints", hide),
+        ] {
+            multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{value}\r\n"));
+        }
+        for (k, json) in files {
+            multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{k}.json\"\r\nContent-Type: application/json\r\n\r\n{json}\r\n"));
+        }
+        multipart.push_str("--test-boundary--\r\n");
+        send(
+            app,
+            "POST",
+            "/upload",
+            Body::from(multipart),
+            Some("multipart/form-data; boundary=test-boundary"),
+            Some(session),
+        )
+        .await
+    }
+    async fn draw_route(app: &Router, session: &str, title: &str, hide: &str) -> String {
+        let response = post_drawn(
+            app,
+            session,
+            title,
+            &[("line", DRAWN_LINE), ("plan", DRAWN_PLAN)],
+            hide,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn drawn_route_is_published_and_renders() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let page = send(
+            &app,
+            "GET",
+            "/routes/new",
+            Body::empty(),
+            None,
+            Some(&session),
+        )
+        .await;
+        assert!(body_text(page).await.contains("id=\"draw-map\""));
+        let location = draw_route(&app, &session, "Drawn River Loop", "0").await;
+        let detail = body_text(send(&app, "GET", &location, Body::empty(), None, None).await).await;
+        assert!(detail.contains("Drawn River Loop"));
+        assert!(detail.contains("<strong>2.2</strong>"));
+        assert!(detail.contains("elevation-chart"));
+        assert_eq!(
+            count(
+                &state,
+                "SELECT count(*) FROM routes WHERE plan_json IS NOT NULL"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn unverified_rider_can_draw_within_daily_limit() {
+        let (app, state, _dir) = setup().await;
+        let session = unverified_rider(&app).await;
+        let page = body_text(
+            send(
+                &app,
+                "GET",
+                "/routes/new",
+                Body::empty(),
+                None,
+                Some(&session),
+            )
+            .await,
+        )
+        .await;
+        assert!(page.contains("name=\"website\""));
+        assert!(page.contains("Unverified accounts can share 5 routes a day"));
+        for i in 0..4 {
+            let gpx = TAIPEI_GPX.replace("<ele>5</ele>", &format!("<ele>{i}</ele>"));
+            upload_route(&app, &session, "Daily Ride", &gpx, "public", "easy").await;
+        }
+        draw_route(&app, &session, "Drawn Ride", "0").await;
+        let sixth = post_drawn(
+            &app,
+            &session,
+            "Another Drawn Ride",
+            &[("line", DRAWN_LINE), ("plan", DRAWN_PLAN)],
+            "0",
+        )
+        .await;
+        assert_eq!(sixth.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(count(&state, "SELECT count(*) FROM routes").await, 5);
+    }
+
+    #[tokio::test]
+    async fn drawn_route_needs_line_and_plan() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let line_only =
+            post_drawn(&app, &session, "Half Drawn", &[("line", DRAWN_LINE)], "0").await;
+        assert_eq!(line_only.status(), StatusCode::BAD_REQUEST);
+        let nothing = post_drawn(&app, &session, "Not Drawn", &[], "0").await;
+        assert_eq!(nothing.status(), StatusCode::BAD_REQUEST);
+        draw_route(&app, &session, "Drawn Once", "0").await;
+        let again = post_drawn(
+            &app,
+            &session,
+            "Drawn Twice",
+            &[("line", DRAWN_LINE), ("plan", DRAWN_PLAN)],
+            "0",
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn hidden_plan_stays_private() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let line = "[[121,25,5],[121,25.01,6],[121,25.02,7],[121,25.03,8],[121,25.04,9]]";
+        let plan = r#"{"points":[[121,25],[121,25.04]],"at":[0,4],"straight":[false]}"#;
+        let response = post_drawn(
+            &app,
+            &session,
+            "Hidden Start",
+            &[("line", line), ("plan", plan)],
+            "250",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let detail = body_text(send(&app, "GET", &location, Body::empty(), None, None).await).await;
+        let geometry = body_text(
+            send(
+                &app,
+                "GET",
+                &format!("{location}/geometry"),
+                Body::empty(),
+                None,
+                None,
+            )
+            .await,
+        )
+        .await;
+        for body in [detail, geometry] {
+            assert!(!body.contains("\"points\"") && !body.contains("&quot;points&quot;"));
+            assert!(!body.contains("data-plan"));
+            assert!(
+                !body.contains("25.0]") && !body.contains("25.0,") && !body.contains("121,25]")
+            );
+        }
+    }
+
+    async fn post_line(
+        app: &Router,
+        session: &str,
+        slug: &str,
+        line: &str,
+        plan: &str,
+    ) -> Response {
+        let page = send(app, "GET", "/upload", Body::empty(), None, Some(session)).await;
+        let csrf = field(&body_text(page).await, "csrf");
+        let multipart = format!("--b\r\nContent-Disposition: form-data; name=\"csrf\"\r\n\r\n{csrf}\r\n--b\r\nContent-Disposition: form-data; name=\"line\"; filename=\"line.json\"\r\n\r\n{line}\r\n--b\r\nContent-Disposition: form-data; name=\"plan\"; filename=\"plan.json\"\r\n\r\n{plan}\r\n--b--\r\n");
+        send(
+            app,
+            "POST",
+            &format!("/routes/{slug}/line"),
+            Body::from(multipart),
+            Some("multipart/form-data; boundary=b"),
+            Some(session),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn owner_redraws_line() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let location = draw_route(&app, &session, "Redrawn Ride", "0").await;
+        let slug = location.trim_start_matches("/routes/");
+        let editor = send(
+            &app,
+            "GET",
+            &format!("{location}/line"),
+            Body::empty(),
+            None,
+            Some(&session),
+        )
+        .await;
+        assert_eq!(editor.status(), StatusCode::OK);
+        assert!(body_text(editor).await.contains("&quot;points&quot;"));
+        let before: (String, f64) =
+            sqlx::query_as("SELECT gpx_key, distance_m FROM routes WHERE slug=?")
+                .bind(slug)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let line = "[[121,25,5],[121,25.01,9],[121,25.02,30],[121,25.04,12]]";
+        let plan = r#"{"points":[[121,25],[121,25.04]],"at":[0,3],"straight":[true]}"#;
+        let saved = post_line(&app, &session, slug, line, plan).await;
+        assert_eq!(saved.status(), StatusCode::SEE_OTHER);
+        assert_eq!(saved.headers()[header::LOCATION], location.as_str());
+        let after: (String, f64) =
+            sqlx::query_as("SELECT gpx_key, distance_m FROM routes WHERE slug=?")
+                .bind(slug)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert!(after.1 > before.1);
+        assert_ne!(after.0, before.0);
+        assert!(!state.storage.join(&before.0).exists());
+        let again = post_line(&app, &session, slug, line, plan).await;
+        assert_eq!(again.status(), StatusCode::SEE_OTHER);
+    }
+
+    #[tokio::test]
+    async fn line_editor_access() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_rider(&app, &state).await;
+        let drawn = draw_route(&app, &owner, "Owner Drawn", "0").await;
+        let uploaded =
+            upload_route(&app, &owner, "Owner Uploaded", TAIPEI_GPX, "public", "easy").await;
+        let other = signed_in_as(&app, &state, "other_rider").await;
+        let get = |path: String, session: String| {
+            let app = app.clone();
+            async move { send(&app, "GET", &path, Body::empty(), None, Some(&session)).await }
+        };
+        assert_eq!(
+            get(format!("{drawn}/line"), other.clone()).await.status(),
+            StatusCode::FORBIDDEN
+        );
+        let slug = drawn.trim_start_matches("/routes/");
+        assert_eq!(
+            post_line(&app, &other, slug, DRAWN_LINE, DRAWN_PLAN)
+                .await
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            get(format!("{uploaded}/line"), owner.clone())
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+        let drawn_edit = body_text(get(format!("{drawn}/edit"), owner.clone()).await).await;
+        assert!(drawn_edit.contains("Edit the line"));
+        let uploaded_edit = body_text(get(format!("{uploaded}/edit"), owner.clone()).await).await;
+        assert!(!uploaded_edit.contains("Edit the line"));
+    }
+
+    #[tokio::test]
+    async fn startup_recomputes_climbing_once() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let good = upload_route(&app, &session, "Good Ride", TAIPEI_GPX, "public", "easy").await;
+        let gpx = line_gpx(26.0, 122.0);
+        let broken = upload_route(&app, &session, "Lost File", &gpx, "public", "easy").await;
+        let slug = |path: &str| path.trim_start_matches("/routes/").to_owned();
+        sqlx::query("UPDATE routes SET elevation_gain_m=0 WHERE slug=?")
+            .bind(slug(&good))
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let key: String = sqlx::query_scalar(
+            "UPDATE routes SET elevation_gain_m=99 WHERE slug=? RETURNING gpx_key",
+        )
+        .bind(slug(&broken))
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        std::fs::remove_file(state.storage.join(key)).unwrap();
+
+        assert_eq!(
+            recompute_climbing(&state.pool, &state.storage)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        let gain = |s: String| {
+            let pool = state.pool.clone();
+            async move {
+                sqlx::query_scalar::<_, f64>("SELECT elevation_gain_m FROM routes WHERE slug=?")
+                    .bind(s)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+        assert_eq!(gain(slug(&good)).await, 35.0);
+        assert_eq!(gain(slug(&broken)).await, 99.0);
+        assert_eq!(count(&state, "SELECT count(*) FROM pending_tasks").await, 0);
+        assert_eq!(
+            recompute_climbing(&state.pool, &state.storage)
+                .await
+                .unwrap(),
+            None
         );
     }
 

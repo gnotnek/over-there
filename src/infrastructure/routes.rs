@@ -26,6 +26,7 @@ pub struct RouteRecord {
     pub duration_s: Option<i64>,
     pub download_count: i64,
     pub cover_key: Option<String>,
+    pub plan_json: Option<String>,
     pub created_at: String,
 }
 

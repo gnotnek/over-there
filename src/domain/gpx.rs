@@ -1,6 +1,6 @@
 use chrono::{DateTime, FixedOffset};
 use roxmltree::{Document, Node, ParsingOptions};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Point {
@@ -63,17 +63,21 @@ pub fn parse(bytes: &[u8]) -> Result<RouteData, String> {
     let mut loss = 0.0;
     let mut elevation_points = 0;
     for seg in &segments {
+        // Climbing is measured from a reference height that moves only after a change of
+        // more than 3 m, so GPS noise is ignored but a climb made of small steps still counts.
+        let mut reference = seg.iter().find_map(|p| p.ele);
         for pair in seg.windows(2) {
             distance_m += haversine(&pair[0], &pair[1]);
-            if let (Some(a), Some(b)) = (pair[0].ele, pair[1].ele) {
+            if pair[0].ele.is_some() && pair[1].ele.is_some() {
                 elevation_points += 1;
-                let change = b - a;
-                // A small deadband avoids counting meter-scale GPS noise as climbing.
-                if change > 3.0 {
-                    gain += change;
-                }
-                if change < -3.0 {
-                    loss -= change;
+            }
+            if let (Some(r), Some(e)) = (reference, pair[1].ele) {
+                if e - r > 3.0 {
+                    gain += e - r;
+                    reference = Some(e);
+                } else if r - e > 3.0 {
+                    loss += r - e;
+                    reference = Some(e);
                 }
             }
         }
@@ -242,7 +246,16 @@ fn simplify(points: &[Point], tolerance: f64) -> Vec<Point> {
 }
 
 pub fn redacted_gpx(segments: &[Vec<Point>]) -> Vec<u8> {
-    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?><gpx version=\"1.1\" creator=\"Over There\" xmlns=\"http://www.topografix.com/GPX/1/1\"><trk><name>Shared route</name>");
+    track_gpx("Shared route", segments)
+}
+
+/// GPX for a line drawn on the map, stored as the route's original file.
+pub fn line_gpx(line: &[Point]) -> Vec<u8> {
+    track_gpx("Planned route", &[line.to_vec()])
+}
+
+fn track_gpx(name: &str, segments: &[Vec<Point>]) -> Vec<u8> {
+    let mut xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><gpx version=\"1.1\" creator=\"Over There\" xmlns=\"http://www.topografix.com/GPX/1/1\"><trk><name>{name}</name>");
     for seg in segments {
         xml.push_str("<trkseg>");
         for p in seg {
@@ -257,6 +270,66 @@ pub fn redacted_gpx(segments: &[Vec<Point>]) -> Vec<u8> {
     }
     xml.push_str("</trk></gpx>");
     xml.into_bytes()
+}
+
+/// The points a rider placed when drawing a route, so the line can be edited later.
+/// `at[k]` is the index in the line where `points[k]` lies; `straight[k]` marks the leg after it.
+#[derive(Debug, Deserialize, Serialize)]
+pub struct Plan {
+    pub points: Vec<[f64; 2]>,
+    pub at: Vec<usize>,
+    pub straight: Vec<bool>,
+}
+
+/// Checks a drawn line (`[[lon, lat, ele?], ...]`) and its plan, and returns the GPX and the plan as JSON.
+pub fn drawn_route(line_json: &[u8], plan_json: &[u8]) -> Result<(Vec<u8>, String), String> {
+    const BROKEN: &str = "The drawn route is incomplete; draw it again";
+    let raw: Vec<Vec<f64>> = serde_json::from_slice(line_json).map_err(|_| BROKEN)?;
+    let plan: Plan = serde_json::from_slice(plan_json).map_err(|_| BROKEN)?;
+    if raw.len() < 2 || raw.len() > 100_000 {
+        return Err("A drawn route needs 2 to 100,000 line points".into());
+    }
+    let line = raw
+        .iter()
+        .map(|c| {
+            let (lon, lat, ele) = match c[..] {
+                [lon, lat] => (lon, lat, None),
+                [lon, lat, ele] => (lon, lat, Some(ele).filter(|e| e.is_finite())),
+                _ => return Err(BROKEN.to_owned()),
+            };
+            if !lat.is_finite()
+                || !lon.is_finite()
+                || !(-90.0..=90.0).contains(&lat)
+                || !(-180.0..=180.0).contains(&lon)
+            {
+                return Err("Point is outside valid coordinates".into());
+            }
+            Ok(Point {
+                lon,
+                lat,
+                ele,
+                time: None,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let n = plan.points.len();
+    if !(2..=100).contains(&n) {
+        return Err("A drawn route needs 2 to 100 points".into());
+    }
+    let consistent = plan.at.len() == n
+        && plan.straight.len() == n - 1
+        && plan.at[0] == 0
+        && plan.at[n - 1] == line.len() - 1
+        && plan.at.windows(2).all(|w| w[0] < w[1])
+        && plan
+            .points
+            .iter()
+            .zip(&plan.at)
+            .all(|(p, &i)| p[0] == line[i].lon && p[1] == line[i].lat);
+    if !consistent {
+        return Err(BROKEN.into());
+    }
+    Ok((line_gpx(&line), serde_json::to_string(&plan).unwrap()))
 }
 
 #[cfg(test)]
@@ -303,6 +376,113 @@ mod tests {
         assert!(profile
             .iter()
             .all(|point| point.2 != 0.0 && point.2 != 0.04));
+    }
+    fn rte(eles: impl Iterator<Item = f64>) -> String {
+        let points: String = eles
+            .enumerate()
+            .map(|(i, e)| {
+                format!(
+                    "<rtept lat=\"0\" lon=\"{}\"><ele>{e}</ele></rtept>",
+                    i as f64 * 0.0005
+                )
+            })
+            .collect();
+        format!("<gpx><rte>{points}</rte></gpx>")
+    }
+    #[test]
+    fn gentle_climb_counts_in_full() {
+        let r = parse(rte((0..=40).map(f64::from)).as_bytes()).unwrap();
+        assert_eq!(r.gain_m, Some(40.0));
+        assert_eq!(r.loss_m, Some(0.0));
+    }
+    #[test]
+    fn small_noise_is_not_climbing() {
+        let r =
+            parse(rte((0..20).map(|i| if i % 2 == 0 { 10.0 } else { 12.0 })).as_bytes()).unwrap();
+        assert_eq!(r.gain_m, Some(0.0));
+    }
+    const LINE: &str = "[[121,25,5],[121,25.01,9],[121,25.02,30]]";
+    const PLAN: &str = r#"{"points":[[121,25],[121,25.02]],"at":[0,2],"straight":[false]}"#;
+    #[test]
+    fn line_gpx_round_trips() {
+        let point = |lat: f64, ele: Option<f64>| Point {
+            lon: 121.0,
+            lat,
+            ele,
+            time: None,
+        };
+        let line = vec![
+            point(25.0, Some(5.0)),
+            point(25.01, None),
+            point(25.02, Some(30.0)),
+        ];
+        let r = parse(&line_gpx(&line)).unwrap();
+        assert_eq!(r.segments.len(), 1);
+        for (a, b) in r.segments[0].iter().zip(&line) {
+            assert_eq!((a.lat, a.lon, a.ele), (b.lat, b.lon, b.ele));
+        }
+        let expected = haversine(&line[0], &line[1]) + haversine(&line[1], &line[2]);
+        assert!((r.distance_m - expected).abs() < 1e-6);
+    }
+    #[test]
+    fn drawn_route_accepts_a_valid_plan() {
+        let (gpx, plan) = drawn_route(LINE.as_bytes(), PLAN.as_bytes()).unwrap();
+        assert_eq!(parse(&gpx).unwrap().segments[0].len(), 3);
+        assert_eq!(serde_json::from_str::<Plan>(&plan).unwrap().at, vec![0, 2]);
+    }
+    #[test]
+    fn drawn_route_rejects_broken_plans() {
+        let many: Vec<String> = (0..101)
+            .map(|i| format!("[121,{}]", 25.0 + i as f64 * 0.001))
+            .collect();
+        let many_line = format!("[{}]", many.join(","));
+        let many_plan = format!(
+            r#"{{"points":[{}],"at":[{}],"straight":[{}]}}"#,
+            many.join(","),
+            (0..101)
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+            vec!["false"; 100].join(",")
+        );
+        let broken = [
+            (LINE, r#"{"points":[[121,25]],"at":[0],"straight":[]}"#),
+            (many_line.as_str(), many_plan.as_str()),
+            (
+                LINE,
+                r#"{"points":[[121,25.01],[121,25.02]],"at":[1,2],"straight":[false]}"#,
+            ),
+            (
+                LINE,
+                r#"{"points":[[121,25],[121,25.01]],"at":[0,1],"straight":[false]}"#,
+            ),
+            (
+                LINE,
+                r#"{"points":[[121,25],[121,25],[121,25.02]],"at":[0,0,2],"straight":[false,false]}"#,
+            ),
+            (
+                LINE,
+                r#"{"points":[[121,25],[121,25.02]],"at":[0,2],"straight":[]}"#,
+            ),
+            (
+                LINE,
+                r#"{"points":[[121,25],[121,25.03]],"at":[0,2],"straight":[false]}"#,
+            ),
+            (
+                "[[121,91],[121,25.02]]",
+                r#"{"points":[[121,91],[121,25.02]],"at":[0,1],"straight":[false]}"#,
+            ),
+            ("[[121],[121,25.02]]", PLAN),
+            ("[[121,25,1,2],[121,25.02]]", PLAN),
+            ("not json", PLAN),
+            (LINE, "not json"),
+        ];
+        for (line, plan) in broken {
+            assert!(
+                drawn_route(line.as_bytes(), plan.as_bytes()).is_err(),
+                "{line} {plan}"
+            );
+        }
     }
     #[test]
     fn redacted_gpx_drops_times_and_keeps_elevation() {

@@ -2,7 +2,7 @@
 
 ## Product reading
 
-Over There is a public library of GPX routes, starting with cycling. A visitor finds a ride by place and effort, studies the line and elevation, then downloads the original file. A contributor uploads a GPX, checks derived facts, chooses visibility, and maintains a public profile. There is no feed, following system, route planner, or navigation.
+Over There is a public library of GPX routes, starting with cycling. A visitor finds a ride by place and effort, studies the line and elevation, then downloads the original file. A contributor uploads a GPX or draws a route on the map, checks derived facts, chooses visibility, and maintains a public profile. Drawing is a small planner: clicked points joined along roads by BRouter, saved as an ordinary route whose line the owner can edit later ([design](specs/2026-10-21-draw-route-design.md)). There is no feed, following system, turn-by-turn directions, or navigation.
 
 The [Komoot home page](https://www.komoot.com/) demonstrates how activity and destination browsing, map context, route difficulty, and clear route presentation aid discovery. Its planning, navigation, and social features are outside this MVP. The supplied [CariRute URL](https://gpx.ai.id/) was unavailable to the research tool on 20 October 2026, so no specific claim about its current features informs this design.
 
@@ -26,9 +26,10 @@ flowchart LR
     browser -->|style and tiles| tiles["Map tile provider"]
     browser -->|MapLibre JS| cdn["unpkg"]
     browser -->|fonts| fonts["Google Fonts"]
+    browser -->|"drawn legs (route planner only)"| routing["BRouter<br/>ROUTING_URL"]
 ```
 
-The server holds all state and renders every page. The browser talks to third parties only for the map library, map tiles and fonts. Tile requests reveal which area a viewer is looking at, including around a private route, so choose a production tile provider whose privacy terms you accept.
+The server holds all state and renders every page. The browser talks to third parties only for the map library, map tiles, fonts and, while a rider draws a route, the BRouter routing service, which sees the points they place. Tile requests reveal which area a viewer is looking at, including around a private route, so choose a production tile provider whose privacy terms you accept.
 
 ### Layers
 

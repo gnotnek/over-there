@@ -61,9 +61,12 @@ Related: [data-catalog.md](data-catalog.md) (what is stored), [service-catalog.m
 | GET | `/verify/{token}` | Anyone | Verifies email → `/dashboard?notice=` |
 | GET | `/dashboard` | User | Own routes and totals |
 | GET | `/upload` | User | Upload form (asks to verify email first if needed) |
-| POST | `/upload` | Verified, CSRF | Creates route → `/routes/{slug}` |
+| GET | `/routes/new` | User | Draw-a-route form, same fields as upload with a map instead of the file |
+| POST | `/upload` | Verified, CSRF | Creates route from a GPX or a drawn line → `/routes/{slug}` |
 | GET | `/routes/{slug}/edit` | Owner | Edit form |
 | POST | `/routes/{slug}/edit` | Owner, CSRF | Updates details → `/routes/{slug}` |
+| GET | `/routes/{slug}/line` | Owner | Line editor for a drawn route; 404 for uploaded routes |
+| POST | `/routes/{slug}/line` | Owner, CSRF | Replaces the line ([details](#post-routesslugline)) → `/routes/{slug}` |
 | POST | `/routes/{slug}/delete` | Owner, CSRF | Deletes route and files → `/dashboard` |
 | POST | `/routes/{slug}/report` | Anyone, CSRF | Files a report → `/routes/{slug}?notice=`; 404 for private routes |
 | GET | `/account` | User | Settings form |
@@ -106,7 +109,8 @@ Multipart fields:
 | Field | Required | Rule |
 | --- | --- | --- |
 | `csrf` | yes | |
-| `gpx` | yes | File, see [GPX input](#gpx-input) |
+| `gpx` | yes, unless drawn | File, see [GPX input](#gpx-input) |
+| `line`, `plan` | drawn routes, both or neither | Files, see [Drawn line](#drawn-line). Used instead of `gpx` |
 | `title` | yes | 4–100 chars |
 | `description` | no | ≤ 2,000 chars |
 | `region`, `country` | yes | 1–80 chars |
@@ -117,11 +121,15 @@ Multipart fields:
 | `hide_endpoints` | no | `0`, `250`, `500`, `1000` metres; anything else means 0 |
 | `cover`, `photo1`–`photo3` | no | Image files |
 
-The same author uploading the same file bytes twice gets 400.
+The same author uploading the same file bytes twice gets 400. A drawn route is checked on the GPX built from its line.
 
 ### `POST /routes/{slug}/edit`
 
 Form: `csrf` plus the same text fields as upload, except files and `hide_endpoints`. The slug and endpoint hiding never change after upload.
+
+### `POST /routes/{slug}/line`
+
+Multipart: `csrf`, `line`, `plan` (see [Drawn line](#drawn-line)). Only for routes with a plan. Rebuilds the original and redacted GPX, geometry, elevation, distance, climbing and bounding box, keeping the route's endpoint hiding, details, photos and download count. Duration becomes empty. The duplicate check ignores the route itself.
 
 ### `GET /routes/{slug}/download`
 
@@ -182,6 +190,15 @@ Otherwise 403. `SameSite=Lax` cookies add a second layer.
 - Each `trkseg` and each `rte` is its own segment. Distance is never measured across a gap between segments.
 - Waypoints (`<wpt>`), names and extensions are ignored.
 
+### Drawn line
+
+Sent by `draw.js` as two multipart file parts, because a long line exceeds the text field limit.
+
+- `line`: JSON `[[lon, lat], …]` or `[[lon, lat, ele], …]`, 2–100,000 points, valid coordinates.
+- `plan`: JSON `{"points": [[lon, lat], …], "at": [i, …], "straight": [bool, …]}` with 2–100 points. `at` starts at 0, strictly increases and ends at the last line index; `points[k]` equals `line[at[k]]`; `straight[k]` marks the leg from point `k` to `k + 1`.
+
+The server builds a GPX 1.1 file with one `<trk>` named "Planned route" and one `<trkseg>` (`gpx::line_gpx`) and treats it as the uploaded original.
+
 ### GPX output (redacted)
 
 Served to visitors when endpoints are hidden: GPX 1.1, one `<trk>` named "Shared route", one `<trkseg>` per public segment, keeping each kept point's `lat`, `lon` and `<ele>`. `<time>` is dropped, so the file does not reveal when the owner rode. Points within the hiding radius of the start or finish are removed. Nothing else from the original file is carried over.
@@ -213,10 +230,14 @@ Embedded in the route page (not an endpoint): a JSON array of `[distance_m, elev
 | `#explore-map` | `data-near` | `"lat,lon"` in nearby mode, else empty | `explore.js` |
 | `.route-card` | `data-slug` | Links a card to its pin | `explore.js` |
 | `#near-me`, `#near-status` | — | Location button and its status text | `explore.js` |
-| `.map-fallback` | — | Placeholder replaced with an error message | both map scripts |
+| `#draw-map` | `data-style`, `data-routing` | `MAP_STYLE_URL`, `ROUTING_URL` | `draw.js` |
+| `#draw-map` | `data-line`, `data-plan`, `data-cycling-type` | Line editor only: the saved line and plan ([Drawn line](#drawn-line)) and the route's cycling type | `draw.js` |
+| `#draw-undo`, `#draw-clear`, `#draw-locate`, `#draw-follow`, `#draw-stats`, `#draw-status`, `#draw-credit`, `#draw-submit` | — | Planner controls and text | `draw.js` |
+| `input[name=line]`, `input[name=plan]` | — | Hidden file inputs filled on submit | `draw.js` |
+| `.map-fallback` | — | Placeholder replaced with an error message | all map scripts |
 | `?notice=` | query | Message shown as a toast | `app.js` |
 
-`explore.js` sends location only as `near=<lat 2dp>,<lon 2dp>&sort=nearest`.
+`explore.js` sends location only as `near=<lat 2dp>,<lon 2dp>&sort=nearest`. `draw.js` never sends the rider's location; it sends placed points to `ROUTING_URL` as `?lonlats=<lon,lat>|<lon,lat>&profile=<fastbike|gravel|mtb|trekking>&alternativeidx=0&format=geojson`, one request per leg, 10 s timeout.
 
 ## Outbound: Brevo
 
@@ -241,7 +262,8 @@ Read from the environment (and `.env`) at startup. See [.env.example](../.env.ex
 | `STORAGE_DIR` | `data/files` | Private file storage; created if missing |
 | `BASE_URL` | `http://127.0.0.1:3000` | Public origin. Used for email links, canonical URLs, the CSRF `Origin` check, and the `Secure` cookie flag when it is HTTPS |
 | `LISTEN_ADDR` | `127.0.0.1:3000` | Bind address (`0.0.0.0:3000` in Docker) |
-| `MAP_STYLE_URL` | `/static/map-style.json` | MapLibre style for both maps |
+| `MAP_STYLE_URL` | `/static/map-style.json` | MapLibre style for every map |
+| `ROUTING_URL` | `https://brouter.de/brouter` | BRouter endpoint the browser calls while drawing a route; point it at a self-hosted BRouter to stop sending points to brouter.de |
 | `BREVO_API_KEY`, `MAIL_FROM` | unset | Email delivery. If unset, verification links are logged |
 | `APP_ENV` | unset | `production` refuses to start without an HTTPS `BASE_URL`, both Brevo variables and a non-default `MAP_STYLE_URL` |
 | `RUST_LOG` | `over_there=info,tower_http=info` | Log filter |
@@ -278,7 +300,8 @@ Each request runs in a `request` span with `id` (a random UUID for correlating l
 | INFO | `signed out` | `user_id` |
 | INFO | `account updated` | `user_id`, `avatar_changed` |
 | INFO | `account deleted` | `user_id`, `routes` |
-| INFO | `route uploaded` | `route_id`, `user_id`, `visibility`, `points`, `segments`, `distance_m`, `hide_endpoints_m`, `photos` |
+| INFO | `route uploaded` | `route_id`, `user_id`, `visibility`, `points`, `segments`, `distance_m`, `hide_endpoints_m`, `photos`, `drawn` |
+| INFO | `route line updated` | `route_id`, `user_id`, `points`, `distance_m` |
 | INFO | `route updated` | `route_id`, `user_id`, `visibility` |
 | INFO | `route deleted` | `route_id`, `user_id` |
 | INFO | `route downloaded` | `route_id`, `original` (served the original file), `counted` |
