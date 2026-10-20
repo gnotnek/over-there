@@ -1,0 +1,1450 @@
+use crate::{
+    domain::{
+        gpx,
+        route::{self, RouteDraft, Visibility},
+    },
+    identity::{
+        auth::{self, User},
+        email,
+    },
+    infrastructure::routes::{self, RouteRecord},
+};
+use axum::{
+    body::Body,
+    extract::{DefaultBodyLimit, Form, Multipart, Path, Query, State},
+    http::{header, HeaderMap, HeaderValue, StatusCode},
+    response::{Html, IntoResponse, Redirect, Response},
+    routing::{get, post},
+    Router,
+};
+use handlebars::Handlebars;
+use image::ImageFormat;
+use serde::Deserialize;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
+use sqlx::{
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    SqlitePool,
+};
+use std::{
+    collections::HashMap,
+    env,
+    path::{Path as FilePath, PathBuf},
+    str::FromStr,
+    sync::Arc,
+};
+use tower_http::{services::ServeDir, trace::TraceLayer};
+use uuid::Uuid;
+
+type WebResult = Result<Response, AppError>;
+
+struct AppState {
+    pool: SqlitePool,
+    templates: Handlebars<'static>,
+    storage: PathBuf,
+    base_url: String,
+    map_style: String,
+    secure_cookie: bool,
+    brevo_api_key: Option<String>,
+    mail_from: Option<String>,
+}
+type Shared = Arc<AppState>;
+
+#[derive(Debug)]
+struct AppError(StatusCode, String);
+impl AppError {
+    fn bad(msg: impl Into<String>) -> Self {
+        Self(StatusCode::BAD_REQUEST, msg.into())
+    }
+    fn forbidden() -> Self {
+        Self(StatusCode::FORBIDDEN, "This action is not available".into())
+    }
+    fn not_found() -> Self {
+        Self(StatusCode::NOT_FOUND, "Route or page not found".into())
+    }
+    fn internal(error: impl std::fmt::Display) -> Self {
+        tracing::error!(%error, "internal error");
+        Self(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Something went wrong".into(),
+        )
+    }
+}
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        let escaped = escape(&self.1);
+        (self.0, Html(format!("<!doctype html><html lang=\"en\"><meta charset=\"utf-8\"><title>Error · Over There</title><link rel=\"stylesheet\" href=\"/static/style.css\"><main class=\"error-page\"><a href=\"/\">Over There</a><h1>{escaped}</h1><p><a href=\"/explore\">Explore routes</a></p></main></html>"))).into_response()
+    }
+}
+
+struct Viewer {
+    user: Option<User>,
+    csrf: String,
+    set_cookie: Option<String>,
+}
+async fn viewer(state: &AppState, headers: &HeaderMap) -> Viewer {
+    if let Some((user, csrf)) = auth::session(&state.pool, headers).await {
+        return Viewer {
+            user: Some(user),
+            csrf,
+            set_cookie: None,
+        };
+    }
+    if let Some(token) = auth::cookie(headers, "ot_csrf")
+        .filter(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        Viewer {
+            user: None,
+            csrf: token,
+            set_cookie: None,
+        }
+    } else {
+        let csrf = auth::random_token();
+        let set_cookie = Some(auth::csrf_cookie(&csrf, state.secure_cookie));
+        Viewer {
+            user: None,
+            csrf,
+            set_cookie,
+        }
+    }
+}
+fn require_user(v: &Viewer) -> Result<&User, AppError> {
+    v.user.as_ref().ok_or_else(auth_required)
+}
+fn auth_required() -> AppError {
+    AppError(
+        StatusCode::UNAUTHORIZED,
+        "Please sign in to continue".into(),
+    )
+}
+fn csrf(
+    headers: &HeaderMap,
+    form: &HashMap<String, String>,
+    viewer: &Viewer,
+    state: &AppState,
+) -> Result<(), AppError> {
+    if auth::check_csrf(headers, val(form, "csrf"), &viewer.csrf, &state.base_url) {
+        Ok(())
+    } else {
+        Err(AppError::forbidden())
+    }
+}
+fn val<'a>(form: &'a HashMap<String, String>, name: &str) -> &'a str {
+    form.get(name).map(String::as_str).unwrap_or("")
+}
+fn escape(input: &str) -> String {
+    input
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+fn base_context(state: &AppState, viewer: &Viewer, title: &str, page: &str) -> Value {
+    let user = viewer.user.as_ref().map(|u| json!({"username":u.username,"admin":u.is_admin!=0,"verified":u.email_verified_at.is_some()}));
+    let mut data = json!({"title":title,"page":page,"csrf":viewer.csrf,"user":user,"base_url":state.base_url,"map_style":state.map_style});
+    data[format!("page_{page}")] = json!(true);
+    data
+}
+fn render(state: &AppState, viewer: Viewer, data: Value) -> WebResult {
+    let html = state
+        .templates
+        .render("page", &data)
+        .map_err(AppError::internal)?;
+    let mut response = Html(html).into_response();
+    if let Some(cookie) = viewer.set_cookie {
+        response.headers_mut().append(
+            header::SET_COOKIE,
+            HeaderValue::from_str(&cookie).map_err(AppError::internal)?,
+        );
+    }
+    Ok(response)
+}
+fn redirect(path: &str) -> Response {
+    Redirect::to(path).into_response()
+}
+fn msg_redirect(path: &str, message: &str) -> Response {
+    let q = message
+        .bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect::<String>();
+    redirect(&format!("{path}?notice={q}"))
+}
+fn route_json(r: &RouteRecord) -> Value {
+    json!({
+        "id":r.id,"slug":r.slug,"title":r.title,"description":r.description,
+        "activity":r.activity,"cycling_type":r.cycling_type,"region":r.region,"country":r.country,
+        "difficulty":r.difficulty,"tags":r.tags,"visibility":r.visibility,
+        "distance_km":format!("{:.1}",r.distance_m/1000.0),
+        "gain":r.elevation_gain_m.map(|v|format!("{:.0}",v)),
+        "loss":r.elevation_loss_m.map(|v|format!("{:.0}",v)),
+        "duration":r.duration_s.map(format_duration),"downloads":r.download_count,
+        "cover":r.cover_key.as_ref().map(|_| format!("/routes/{}/cover",r.slug)),
+        "preview": preview_svg(&r.geometry_json), "created":r.created_at.get(..10).unwrap_or(&r.created_at),
+        "endpoint_hidden":r.hide_endpoints_m>0.0,
+    })
+}
+fn format_duration(s: i64) -> String {
+    format!("{}h {}m", s / 3600, (s % 3600) / 60)
+}
+fn preview_svg(geometry: &str) -> String {
+    let Ok(value) = serde_json::from_str::<Value>(geometry) else {
+        return String::new();
+    };
+    let Some(lines) = value["coordinates"].as_array() else {
+        return String::new();
+    };
+    let points: Vec<(f64, f64)> = lines
+        .iter()
+        .flat_map(|l| l.as_array().into_iter().flatten())
+        .filter_map(|p| Some((p.get(0)?.as_f64()?, p.get(1)?.as_f64()?)))
+        .collect();
+    if points.is_empty() {
+        return String::new();
+    }
+    let (mut minx, mut maxx, mut miny, mut maxy) = (180.0f64, -180.0f64, 90.0f64, -90.0f64);
+    for &(x, y) in &points {
+        minx = minx.min(x);
+        maxx = maxx.max(x);
+        miny = miny.min(y);
+        maxy = maxy.max(y);
+    }
+    let sx = 340.0 / (maxx - minx).max(0.0001);
+    let sy = 190.0 / (maxy - miny).max(0.0001);
+    let scale = sx.min(sy);
+    let ox = (400.0 - (maxx - minx) * scale) / 2.0;
+    let oy = (250.0 - (maxy - miny) * scale) / 2.0;
+    let paths = lines
+        .iter()
+        .filter_map(Value::as_array)
+        .map(|line| {
+            let d = line
+                .iter()
+                .filter_map(|p| Some((p.get(0)?.as_f64()?, p.get(1)?.as_f64()?)))
+                .enumerate()
+                .map(|(i, (x, y))| {
+                    format!(
+                        "{} {:.1} {:.1}",
+                        if i == 0 { "M" } else { "L" },
+                        ox + (x - minx) * scale,
+                        250.0 - oy - (y - miny) * scale
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("<path d=\"{d}\"/>")
+        })
+        .collect::<String>();
+    format!("<svg viewBox=\"0 0 400 250\" role=\"img\" aria-label=\"Route trace preview\"><path class=\"contour\" d=\"M-10 206 Q90 120 175 209 T410 180 M-10 145 Q90 60 175 146 T410 105 M-10 75 Q90 -10 175 76 T410 35\"/><g class=\"route-line\">{paths}</g></svg>")
+}
+
+async fn get_route(pool: &SqlitePool, slug: &str) -> Result<RouteRecord, AppError> {
+    routes::find_by_slug(pool, slug)
+        .await
+        .map_err(AppError::internal)?
+        .ok_or_else(AppError::not_found)
+}
+fn can_view(r: &RouteRecord, user: Option<&User>) -> bool {
+    route::may_view(
+        Visibility::parse(&r.visibility).unwrap_or(Visibility::Private),
+        &r.author_id,
+        user.map(|u| u.id.as_str()),
+        user.is_some_and(|u| u.is_admin != 0),
+    )
+}
+fn can_edit(r: &RouteRecord, user: &User) -> bool {
+    route::may_edit(&r.author_id, &user.id, user.is_admin != 0)
+}
+fn valid_choice(value: &str, choices: &[&str]) -> bool {
+    choices.contains(&value)
+}
+
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    dotenvy::dotenv().ok();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "over_there=info,tower_http=info".into()),
+        )
+        .init();
+    let db_url = env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/over-there.db".into());
+    let storage = PathBuf::from(env::var("STORAGE_DIR").unwrap_or_else(|_| "data/files".into()));
+    tokio::fs::create_dir_all(&storage).await?;
+    if let Some(parent) = FilePath::new(db_url.trim_start_matches("sqlite://")).parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let opts = SqliteConnectOptions::from_str(&db_url)?
+        .create_if_missing(true)
+        .foreign_keys(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(opts)
+        .await?;
+    sqlx::migrate!().run(&pool).await?;
+    let mut templates = Handlebars::new();
+    handlebars::handlebars_helper!(eq: |a: str, b: str| a == b);
+    templates.register_helper("eq", Box::new(eq));
+    templates.register_template_string("page", include_str!("../../templates/page.hbs"))?;
+    let base_url = env::var("BASE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3000".into())
+        .trim_end_matches('/')
+        .to_owned();
+    let map_style = env::var("MAP_STYLE_URL").unwrap_or_else(|_| "/static/map-style.json".into());
+    let brevo_api_key = env::var("BREVO_API_KEY").ok();
+    let mail_from = env::var("MAIL_FROM").ok();
+    if env::var("APP_ENV").as_deref() == Ok("production") {
+        if !base_url.starts_with("https://")
+            || brevo_api_key.is_none()
+            || mail_from.is_none()
+            || map_style == "/static/map-style.json"
+        {
+            return Err(
+                "Production requires HTTPS BASE_URL, Brevo email configuration, and MAP_STYLE_URL"
+                    .into(),
+            );
+        }
+    }
+    let state = Arc::new(AppState {
+        pool,
+        templates,
+        storage,
+        secure_cookie: base_url.starts_with("https://"),
+        base_url,
+        map_style,
+        brevo_api_key,
+        mail_from,
+    });
+    let app = router(state);
+    let addr = env::var("LISTEN_ADDR").unwrap_or_else(|_| "127.0.0.1:3000".into());
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    tracing::info!(%addr,"Over There listening");
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+fn router(state: Shared) -> Router {
+    Router::new()
+        .route("/", get(home))
+        .route("/explore", get(explore))
+        .route("/register", get(register_form).post(register))
+        .route("/login", get(login_form).post(login))
+        .route("/logout", post(logout))
+        .route("/verify/{token}", get(verify_email))
+        .route("/upload", get(upload_form).post(upload))
+        .route("/routes/{slug}", get(route_detail))
+        .route("/routes/{slug}/geometry", get(route_geometry))
+        .route("/routes/{slug}/download", get(download))
+        .route("/routes/{slug}/cover", get(route_cover))
+        .route("/routes/{slug}/images/{id}", get(route_image))
+        .route("/routes/{slug}/edit", get(edit_form).post(edit_route))
+        .route("/routes/{slug}/delete", post(delete_route))
+        .route("/routes/{slug}/report", post(report_route))
+        .route("/users/{username}", get(profile))
+        .route("/users/{username}/avatar", get(avatar))
+        .route("/dashboard", get(dashboard))
+        .route("/account", get(account_form).post(account_update))
+        .route("/account/resend-verification", post(resend_verification))
+        .route("/admin", get(admin))
+        .route("/admin/users/{id}/contributor", post(admin_contributor))
+        .route("/admin/reports/{id}", post(admin_report))
+        .nest_service("/static", ServeDir::new("static"))
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+async fn home(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let routes: Vec<RouteRecord> = sqlx::query_as(
+        "SELECT * FROM routes WHERE visibility='public' ORDER BY created_at DESC LIMIT 4",
+    )
+    .fetch_all(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
+    let mut data = base_context(&state, &v, "Find your next ride", "home");
+    data["routes"] = json!(routes.iter().map(route_json).collect::<Vec<_>>());
+    data["featured"] = routes.first().map(route_json).unwrap_or(Value::Null);
+    render(&state, v, data)
+}
+
+#[derive(Default, Deserialize)]
+struct ExploreQuery {
+    q: Option<String>,
+    region: Option<String>,
+    cycling_type: Option<String>,
+    difficulty: Option<String>,
+    min_km: Option<f64>,
+    max_km: Option<f64>,
+    sort: Option<String>,
+    page: Option<i64>,
+}
+async fn explore(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Query(q): Query<ExploreQuery>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let query = q.q.unwrap_or_default().trim().to_owned();
+    let region = q.region.unwrap_or_default().trim().to_owned();
+    let cycling_type = q.cycling_type.unwrap_or_default();
+    let difficulty = q.difficulty.unwrap_or_default();
+    let min_km = q.min_km.unwrap_or(0.0).max(0.0);
+    let max_km = q.max_km.unwrap_or(100_000.0).max(min_km);
+    let page = q.page.unwrap_or(1).clamp(1, 10_000);
+    let sort = q.sort.unwrap_or_else(|| "newest".into());
+    let sql = if sort == "popular" {
+        "SELECT * FROM routes WHERE visibility='public' AND (?='' OR title LIKE '%'||?||'%') AND (?='' OR region LIKE '%'||?||'%') AND (?='' OR cycling_type=?) AND (?='' OR difficulty=?) AND distance_m>=? AND distance_m<=? ORDER BY download_count DESC, created_at DESC LIMIT 12 OFFSET ?"
+    } else {
+        "SELECT * FROM routes WHERE visibility='public' AND (?='' OR title LIKE '%'||?||'%') AND (?='' OR region LIKE '%'||?||'%') AND (?='' OR cycling_type=?) AND (?='' OR difficulty=?) AND distance_m>=? AND distance_m<=? ORDER BY created_at DESC LIMIT 12 OFFSET ?"
+    };
+    let routes: Vec<RouteRecord> = sqlx::query_as(sql)
+        .bind(&query)
+        .bind(&query)
+        .bind(&region)
+        .bind(&region)
+        .bind(&cycling_type)
+        .bind(&cycling_type)
+        .bind(&difficulty)
+        .bind(&difficulty)
+        .bind(min_km * 1000.0)
+        .bind(max_km * 1000.0)
+        .bind((page - 1) * 12)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    let count:i64=sqlx::query_scalar("SELECT count(*) FROM routes WHERE visibility='public' AND (?='' OR title LIKE '%'||?||'%') AND (?='' OR region LIKE '%'||?||'%') AND (?='' OR cycling_type=?) AND (?='' OR difficulty=?) AND distance_m>=? AND distance_m<=?")
+        .bind(&query).bind(&query).bind(&region).bind(&region).bind(&cycling_type).bind(&cycling_type).bind(&difficulty).bind(&difficulty).bind(min_km*1000.0).bind(max_km*1000.0)
+        .fetch_one(&state.pool).await.map_err(AppError::internal)?;
+    let mut data = base_context(&state, &v, "Explore routes", "explore");
+    data["routes"] = json!(routes.iter().map(route_json).collect::<Vec<_>>());
+    data["filters"] = json!({"q":query,"region":region,"cycling_type":cycling_type,"difficulty":difficulty,"min_km":if min_km>0.0 {Some(min_km)}else{None},"max_km":if max_km<100_000.0{Some(max_km)}else{None},"popular":sort=="popular"});
+    data["count"] = json!(count);
+    data["page_number"] = json!(page);
+    data["has_prev"] = json!(page > 1);
+    data["has_next"] = json!(page * 12 < count);
+    data["prev_page"] = json!(page - 1);
+    data["next_page"] = json!(page + 1);
+    render(&state, v, data)
+}
+
+async fn route_detail(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let r = get_route(&state.pool, &slug).await?;
+    if !can_view(&r, v.user.as_ref()) {
+        return Err(AppError::not_found());
+    }
+    let author:User=sqlx::query_as("SELECT id,username,email,bio,avatar_key,email_verified_at,contributor_verified_at,is_admin FROM users WHERE id=?")
+        .bind(&r.author_id).fetch_one(&state.pool).await.map_err(AppError::internal)?;
+    let mut data = base_context(&state, &v, &r.title, "route");
+    data["route"] = route_json(&r);
+    data["author"] = json!({"username":author.username,"verified":author.contributor_verified_at.is_some(),"avatar":author.avatar_key.is_some()});
+    data["can_edit"] = json!(v.user.as_ref().is_some_and(|u| can_edit(&r, u)));
+    data["elevation_json"] = json!(r.elevation_json);
+    let photos: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM route_images WHERE route_id=? ORDER BY position,id")
+            .bind(&r.id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    data["photos"] = json!(photos
+        .iter()
+        .map(|id| format!("/routes/{}/images/{id}", r.slug))
+        .collect::<Vec<_>>());
+    data["canonical"] = json!(format!("{}/routes/{}", state.base_url, r.slug));
+    render(&state, v, data)
+}
+
+async fn route_geometry(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let r = get_route(&state.pool, &slug).await?;
+    if !can_view(&r, v.user.as_ref()) {
+        return Err(AppError::not_found());
+    }
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/geo+json"),
+            (header::CACHE_CONTROL, "private, max-age=60"),
+        ],
+        r.geometry_json,
+    )
+        .into_response())
+}
+
+async fn download(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let r = get_route(&state.pool, &slug).await?;
+    if !can_view(&r, v.user.as_ref()) {
+        return Err(AppError::not_found());
+    }
+    let owner = v.user.as_ref().is_some_and(|u| can_edit(&r, u));
+    let key = if owner {
+        &r.gpx_key
+    } else {
+        r.public_gpx_key.as_ref().unwrap_or(&r.gpx_key)
+    };
+    let bytes = tokio::fs::read(state.storage.join(key))
+        .await
+        .map_err(AppError::internal)?;
+    sqlx::query("UPDATE routes SET download_count=download_count+1 WHERE id=?")
+        .bind(&r.id)
+        .execute(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    let filename = format!("{}.gpx", r.slug);
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/gpx+xml".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+            (header::CACHE_CONTROL, "private, no-store".to_string()),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
+async fn route_cover(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let r = get_route(&state.pool, &slug).await?;
+    if !can_view(&r, v.user.as_ref()) {
+        return Err(AppError::not_found());
+    }
+    let key = r.cover_key.ok_or_else(AppError::not_found)?;
+    serve_image(&state, &key).await
+}
+async fn route_image(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((slug, id)): Path<(String, String)>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let r = get_route(&state.pool, &slug).await?;
+    if !can_view(&r, v.user.as_ref()) {
+        return Err(AppError::not_found());
+    }
+    let key: Option<String> =
+        sqlx::query_scalar("SELECT image_key FROM route_images WHERE id=? AND route_id=?")
+            .bind(id)
+            .bind(&r.id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    serve_image(&state, &key.ok_or_else(AppError::not_found)?).await
+}
+async fn avatar(State(state): State<Shared>, Path(username): Path<String>) -> WebResult {
+    let user:User=sqlx::query_as("SELECT id,username,email,bio,avatar_key,email_verified_at,contributor_verified_at,is_admin FROM users WHERE username=?")
+        .bind(username).fetch_optional(&state.pool).await.map_err(AppError::internal)?.ok_or_else(AppError::not_found)?;
+    serve_image(&state, &user.avatar_key.ok_or_else(AppError::not_found)?).await
+}
+async fn serve_image(state: &AppState, key: &str) -> WebResult {
+    let bytes = tokio::fs::read(state.storage.join(key))
+        .await
+        .map_err(AppError::internal)?;
+    Ok((
+        [
+            (header::CONTENT_TYPE, "image/webp"),
+            (header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        Body::from(bytes),
+    )
+        .into_response())
+}
+
+async fn profile(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(username): Path<String>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user:User=sqlx::query_as("SELECT id,username,email,bio,avatar_key,email_verified_at,contributor_verified_at,is_admin FROM users WHERE username=?")
+        .bind(username).fetch_optional(&state.pool).await.map_err(AppError::internal)?.ok_or_else(AppError::not_found)?;
+    let routes:Vec<RouteRecord>=sqlx::query_as("SELECT * FROM routes WHERE author_id=? AND visibility='public' ORDER BY created_at DESC LIMIT 48")
+        .bind(&user.id).fetch_all(&state.pool).await.map_err(AppError::internal)?;
+    let mut data = base_context(&state, &v, &user.username, "profile");
+    data["profile"] = json!({"username":user.username,"bio":user.bio,"avatar":user.avatar_key.is_some(),"verified":user.contributor_verified_at.is_some(),"count":routes.len()});
+    data["routes"] = json!(routes.iter().map(route_json).collect::<Vec<_>>());
+    render(&state, v, data)
+}
+
+async fn register_form(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let data = base_context(&state, &v, "Create an account", "register");
+    render(&state, v, data)
+}
+async fn login_form(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let data = base_context(&state, &v, "Sign in", "login");
+    render(&state, v, data)
+}
+async fn register(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    csrf(&headers, &form, &v, &state)?;
+    let username = val(&form, "username").trim().to_ascii_lowercase();
+    let email = val(&form, "email").trim().to_ascii_lowercase();
+    let password = val(&form, "password");
+    if username.len() < 3
+        || username.len() > 32
+        || !username
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+    {
+        return Err(AppError::bad(
+            "Username must be 3–32 lowercase letters, numbers or underscores",
+        ));
+    }
+    email::validate(&email).map_err(AppError::bad)?;
+    if password.len() < 12 || password.len() > 128 {
+        return Err(AppError::bad("Password must be 12–128 characters"));
+    }
+    let id = Uuid::new_v4().to_string();
+    let hash = auth::password_hash(password);
+    let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
+    sqlx::query("INSERT INTO users(id,username,email,password_hash) VALUES (?,?,?,?)")
+        .bind(&id)
+        .bind(&username)
+        .bind(&email)
+        .bind(hash)
+        .execute(&mut *tx)
+        .await
+        .map_err(|_| AppError::bad("Username or email is already in use"))?;
+    let verification = auth::random_token();
+    let expires = (chrono::Utc::now() + chrono::Duration::days(2))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    sqlx::query("INSERT INTO email_verifications(token_hash,user_id,expires_at) VALUES (?,?,?)")
+        .bind(auth::token_hash(&verification))
+        .bind(&id)
+        .bind(expires)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    if state.brevo_api_key.is_some() {
+        let quota=sqlx::query("INSERT INTO email_send_quota(day,sent) VALUES (date('now'),1) ON CONFLICT(day) DO UPDATE SET sent=sent+1 WHERE sent<250")
+            .execute(&mut *tx).await.map_err(AppError::internal)?;
+        if quota.rows_affected() == 0 {
+            return Err(AppError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Registration is temporarily full for today. Try again tomorrow".into(),
+            ));
+        }
+    }
+    send_verification(&state, &email, &verification).await?;
+    tx.commit().await.map_err(AppError::internal)?;
+    let (token, _) = auth::create_session(&state.pool, &id)
+        .await
+        .map_err(AppError::internal)?;
+    let mut response = msg_redirect("/dashboard", "Check your email to verify your address");
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&auth::session_cookie(&token, state.secure_cookie))
+            .map_err(AppError::internal)?,
+    );
+    Ok(response)
+}
+async fn send_verification(state: &AppState, email: &str, token: &str) -> Result<(), AppError> {
+    let link = format!("{}/verify/{}", state.base_url, token);
+    if let (Some(api), Some(from)) = (&state.brevo_api_key, &state.mail_from) {
+        let result=reqwest::Client::new().post("https://api.brevo.com/v3/smtp/email")
+            .header("api-key",api).json(&json!({"sender":{"name":"Over There","email":from},"to":[{"email":email}],"subject":"Verify your Over There email","textContent":format!("Verify your email: {link}\nThis link expires in 48 hours.")}))
+            .send().await.map_err(AppError::internal)?;
+        if !result.status().is_success() {
+            return Err(AppError::internal(format!(
+                "email provider returned {}",
+                result.status()
+            )));
+        }
+    } else {
+        tracing::warn!(%email,%link,"Development email verification link");
+    }
+    Ok(())
+}
+async fn verify_email(State(state): State<Shared>, Path(token): Path<String>) -> WebResult {
+    if token.len() != 64 {
+        return Err(AppError::bad("Invalid verification link"));
+    }
+    let hash = auth::token_hash(&token);
+    let user_id: Option<String> = sqlx::query_scalar(
+        "SELECT user_id FROM email_verifications WHERE token_hash=? AND expires_at>datetime('now')",
+    )
+    .bind(&hash)
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
+    let id = user_id.ok_or_else(|| AppError::bad("Verification link is invalid or expired"))?;
+    let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
+    sqlx::query("UPDATE users SET email_verified_at=datetime('now') WHERE id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    sqlx::query("DELETE FROM email_verifications WHERE user_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    tx.commit().await.map_err(AppError::internal)?;
+    Ok(msg_redirect(
+        "/dashboard",
+        "Email verified. You can now share routes",
+    ))
+}
+async fn login(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    csrf(&headers, &form, &v, &state)?;
+    let email = val(&form, "email").trim().to_ascii_lowercase();
+    let blocked:Option<i64>=sqlx::query_scalar("SELECT failures FROM auth_attempts WHERE email=? AND window_started_at>datetime('now','-15 minutes')")
+        .bind(&email).fetch_optional(&state.pool).await.map_err(AppError::internal)?;
+    if blocked.unwrap_or(0) >= 10 {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Too many sign-in attempts. Try again in 15 minutes".into(),
+        ));
+    }
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT id,password_hash FROM users WHERE email=?")
+            .bind(&email)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    let valid = row
+        .as_ref()
+        .is_some_and(|(_, hash)| auth::verify_password(val(&form, "password"), hash));
+    if !valid {
+        sqlx::query("INSERT INTO auth_attempts(email,failures,window_started_at) VALUES (?,1,datetime('now')) ON CONFLICT(email) DO UPDATE SET failures=CASE WHEN window_started_at<datetime('now','-15 minutes') THEN 1 ELSE failures+1 END,window_started_at=CASE WHEN window_started_at<datetime('now','-15 minutes') THEN datetime('now') ELSE window_started_at END")
+            .bind(&email).execute(&state.pool).await.map_err(AppError::internal)?;
+        return Err(AppError(
+            StatusCode::UNAUTHORIZED,
+            "Email or password is incorrect".into(),
+        ));
+    }
+    let id = row.unwrap().0;
+    sqlx::query("DELETE FROM auth_attempts WHERE email=?")
+        .bind(&email)
+        .execute(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    let (token, _) = auth::create_session(&state.pool, &id)
+        .await
+        .map_err(AppError::internal)?;
+    let mut response = redirect("/dashboard");
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_str(&auth::session_cookie(&token, state.secure_cookie))
+            .map_err(AppError::internal)?,
+    );
+    Ok(response)
+}
+async fn logout(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    csrf(&headers, &form, &v, &state)?;
+    if let Some(token) = auth::cookie(&headers, "ot_session") {
+        sqlx::query("DELETE FROM sessions WHERE token_hash=?")
+            .bind(auth::token_hash(&token))
+            .execute(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    let mut response = redirect("/");
+    response.headers_mut().append(
+        header::SET_COOKIE,
+        HeaderValue::from_static("ot_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"),
+    );
+    Ok(response)
+}
+
+async fn dashboard(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    let routes: Vec<RouteRecord> =
+        sqlx::query_as("SELECT * FROM routes WHERE author_id=? ORDER BY created_at DESC")
+            .bind(&user.id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    let mut data = base_context(&state, &v, "Your routes", "dashboard");
+    data["routes"] = json!(routes.iter().map(route_json).collect::<Vec<_>>());
+    data["stats"] = json!({"count":routes.len(),"km":format!("{:.1}",routes.iter().map(|r|r.distance_m).sum::<f64>()/1000.0),
+        "public":routes.iter().filter(|r|r.visibility=="public").count(),"private":routes.iter().filter(|r|r.visibility=="private").count(),
+        "downloads":routes.iter().map(|r|r.download_count).sum::<i64>()});
+    render(&state, v, data)
+}
+
+async fn upload_form(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    require_user(&v)?;
+    let data = base_context(&state, &v, "Share a route", "upload");
+    render(&state, v, data)
+}
+async fn multipart_values(
+    mut multipart: Multipart,
+) -> Result<(HashMap<String, String>, HashMap<String, Vec<u8>>), AppError> {
+    let mut text = HashMap::new();
+    let mut files = HashMap::new();
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|_| AppError::bad("Invalid upload form"))?
+    {
+        let name = field.name().unwrap_or("").to_owned();
+        if name.is_empty() {
+            continue;
+        }
+        if field.file_name().is_some() {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|_| AppError::bad("Unable to read uploaded file"))?;
+            files.insert(name, bytes.to_vec());
+        } else {
+            let value = field
+                .text()
+                .await
+                .map_err(|_| AppError::bad("Invalid form field"))?;
+            if value.len() > 5_000 {
+                return Err(AppError::bad("Form field is too long"));
+            }
+            text.insert(name, value);
+        }
+    }
+    Ok((text, files))
+}
+async fn write_asset(state: &AppState, bytes: &[u8], ext: &str) -> Result<String, AppError> {
+    let key = format!("{}.{}", Uuid::new_v4(), ext);
+    tokio::fs::write(state.storage.join(&key), bytes)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(key)
+}
+fn optimized_image(bytes: &[u8], max: u32) -> Result<Vec<u8>, AppError> {
+    if bytes.is_empty() || bytes.len() > 5 * 1024 * 1024 {
+        return Err(AppError::bad("Image must be 5 MB or less"));
+    }
+    let image = image::load_from_memory(bytes)
+        .map_err(|_| AppError::bad("Image must be JPEG, PNG or WebP"))?;
+    if image.width() as u64 * image.height() as u64 > 30_000_000 {
+        return Err(AppError::bad("Image dimensions are too large"));
+    }
+    let image = image.resize(max, max, image::imageops::FilterType::Lanczos3);
+    let mut out = std::io::Cursor::new(Vec::new());
+    image
+        .write_to(&mut out, ImageFormat::WebP)
+        .map_err(AppError::internal)?;
+    Ok(out.into_inner())
+}
+async fn upload(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    if user.email_verified_at.is_none() {
+        return Err(AppError::forbidden());
+    }
+    let (form, mut files) = multipart_values(multipart).await?;
+    csrf(&headers, &form, &v, &state)?;
+    let draft = RouteDraft::from_fields(&form).map_err(AppError::bad)?;
+    let raw = files
+        .remove("gpx")
+        .ok_or_else(|| AppError::bad("Choose a GPX file"))?;
+    let parsed = gpx::parse(&raw).map_err(AppError::bad)?;
+    let sha = format!("{:x}", Sha256::digest(&raw));
+    let duplicate: Option<String> =
+        sqlx::query_scalar("SELECT slug FROM routes WHERE author_id=? AND gpx_sha256=? LIMIT 1")
+            .bind(&user.id)
+            .bind(&sha)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    if duplicate.is_some() {
+        return Err(AppError::bad("You already uploaded this GPX file"));
+    }
+    let hide = match val(&form, "hide_endpoints") {
+        "250" => 250.0,
+        "500" => 500.0,
+        "1000" => 1000.0,
+        _ => 0.0,
+    };
+    let public_segments = gpx::public_segments(&parsed.segments, hide).map_err(AppError::bad)?;
+    let geometry = gpx::geojson(&public_segments);
+    let id = Uuid::new_v4().to_string();
+    let slug = route::slugify(&draft.title, &id);
+    let gpx_key = write_asset(&state, &raw, "gpx").await?;
+    let public_gpx_key = if hide > 0.0 {
+        Some(write_asset(&state, &gpx::redacted_gpx(&public_segments), "gpx").await?)
+    } else {
+        None
+    };
+    let cover_key = if let Some(image) = files.remove("cover").filter(|v| !v.is_empty()) {
+        Some(write_asset(&state, &optimized_image(&image, 1600)?, "webp").await?)
+    } else {
+        None
+    };
+    let mut photo_keys = Vec::new();
+    for name in ["photo1", "photo2", "photo3"] {
+        if let Some(image) = files.remove(name).filter(|v| !v.is_empty()) {
+            photo_keys.push(write_asset(&state, &optimized_image(&image, 1600)?, "webp").await?);
+        }
+    }
+    let elevation = gpx::elevation_profile(&public_segments)
+        .as_ref()
+        .map(|e| serde_json::to_string(e).unwrap());
+    let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
+    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key) VALUES (?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        .bind(&id).bind(&user.id).bind(&slug).bind(&draft.title).bind(&draft.description)
+        .bind(&draft.cycling_type).bind(&draft.region).bind(&draft.country)
+        .bind(&draft.difficulty).bind(&draft.tags).bind(draft.visibility_str())
+        .bind(&gpx_key).bind(&public_gpx_key).bind(&sha).bind(hide).bind(&geometry).bind(&elevation)
+        .bind(parsed.distance_m).bind(parsed.gain_m).bind(parsed.loss_m).bind(parsed.duration_s).bind(&cover_key)
+        .execute(&mut *tx).await;
+    if let Err(e) = result {
+        let _ = tokio::fs::remove_file(state.storage.join(gpx_key)).await;
+        if let Some(k) = public_gpx_key {
+            let _ = tokio::fs::remove_file(state.storage.join(k)).await;
+        }
+        if let Some(k) = cover_key {
+            let _ = tokio::fs::remove_file(state.storage.join(k)).await;
+        }
+        for key in photo_keys {
+            let _ = tokio::fs::remove_file(state.storage.join(key)).await;
+        }
+        return Err(AppError::internal(e));
+    }
+    for (position, key) in photo_keys.iter().enumerate() {
+        sqlx::query("INSERT INTO route_images(id,route_id,image_key,position) VALUES (?,?,?,?)")
+            .bind(Uuid::new_v4().to_string())
+            .bind(&id)
+            .bind(key)
+            .bind(position as i64)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    tx.commit().await.map_err(AppError::internal)?;
+    Ok(redirect(&format!("/routes/{slug}")))
+}
+
+async fn edit_form(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    let r = get_route(&state.pool, &slug).await?;
+    if !can_edit(&r, user) {
+        return Err(AppError::forbidden());
+    }
+    let mut data = base_context(&state, &v, "Edit route", "edit");
+    data["route"] = route_json(&r);
+    render(&state, v, data)
+}
+async fn edit_route(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    csrf(&headers, &form, &v, &state)?;
+    let r = get_route(&state.pool, &slug).await?;
+    if !can_edit(&r, user) {
+        return Err(AppError::forbidden());
+    }
+    let draft = RouteDraft::from_fields(&form).map_err(AppError::bad)?;
+    sqlx::query("UPDATE routes SET title=?,description=?,cycling_type=?,region=?,country=?,difficulty=?,tags=?,visibility=?,updated_at=datetime('now') WHERE id=?")
+        .bind(&draft.title).bind(&draft.description).bind(&draft.cycling_type)
+        .bind(&draft.region).bind(&draft.country).bind(&draft.difficulty)
+        .bind(&draft.tags).bind(draft.visibility_str()).bind(&r.id)
+        .execute(&state.pool).await.map_err(AppError::internal)?;
+    Ok(redirect(&format!("/routes/{slug}")))
+}
+async fn delete_route(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    csrf(&headers, &form, &v, &state)?;
+    let r = get_route(&state.pool, &slug).await?;
+    if !can_edit(&r, user) {
+        return Err(AppError::forbidden());
+    }
+    let photos: Vec<String> =
+        sqlx::query_scalar("SELECT image_key FROM route_images WHERE route_id=?")
+            .bind(&r.id)
+            .fetch_all(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    sqlx::query("DELETE FROM routes WHERE id=?")
+        .bind(&r.id)
+        .execute(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    for key in [Some(r.gpx_key), r.public_gpx_key, r.cover_key]
+        .into_iter()
+        .flatten()
+    {
+        let _ = tokio::fs::remove_file(state.storage.join(key)).await;
+    }
+    for key in photos {
+        let _ = tokio::fs::remove_file(state.storage.join(key)).await;
+    }
+    Ok(redirect("/dashboard"))
+}
+
+async fn account_form(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let u = require_user(&v)?;
+    let mut data = base_context(&state, &v, "Account settings", "account");
+    data["account"] = json!({"username":u.username,"email":u.email,"bio":u.bio,"avatar":u.avatar_key.is_some(),"verified":u.email_verified_at.is_some()});
+    render(&state, v, data)
+}
+async fn account_update(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    multipart: Multipart,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let u = require_user(&v)?;
+    let (form, mut files) = multipart_values(multipart).await?;
+    csrf(&headers, &form, &v, &state)?;
+    let bio = val(&form, "bio").trim();
+    if bio.len() > 300 {
+        return Err(AppError::bad("Biography must be 300 characters or less"));
+    }
+    let avatar_key = if let Some(image) = files.remove("avatar").filter(|v| !v.is_empty()) {
+        Some(write_asset(&state, &optimized_image(&image, 512)?, "webp").await?)
+    } else {
+        None
+    };
+    if let Some(key) = &avatar_key {
+        sqlx::query("UPDATE users SET bio=?,avatar_key=? WHERE id=?")
+            .bind(bio)
+            .bind(key)
+            .bind(&u.id)
+            .execute(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+        if let Some(old) = &u.avatar_key {
+            let _ = tokio::fs::remove_file(state.storage.join(old)).await;
+        }
+    } else {
+        sqlx::query("UPDATE users SET bio=? WHERE id=?")
+            .bind(bio)
+            .bind(&u.id)
+            .execute(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    }
+    Ok(msg_redirect("/account", "Account updated"))
+}
+
+async fn resend_verification(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let u = require_user(&v)?;
+    csrf(&headers, &form, &v, &state)?;
+    if u.email_verified_at.is_some() {
+        return Ok(redirect("/account"));
+    }
+    let recent: i64 = sqlx::query_scalar("SELECT count(*) FROM email_verifications WHERE user_id=? AND sent_at>datetime('now','-10 minutes')")
+        .bind(&u.id).fetch_one(&state.pool).await.map_err(AppError::internal)?;
+    if recent > 0 {
+        return Err(AppError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "Please wait 10 minutes before requesting another link".into(),
+        ));
+    }
+    let token = auth::random_token();
+    let expires = (chrono::Utc::now() + chrono::Duration::days(2))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
+    let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
+    if state.brevo_api_key.is_some() {
+        let quota=sqlx::query("INSERT INTO email_send_quota(day,sent) VALUES (date('now'),1) ON CONFLICT(day) DO UPDATE SET sent=sent+1 WHERE sent<250")
+            .execute(&mut *tx).await.map_err(AppError::internal)?;
+        if quota.rows_affected() == 0 {
+            return Err(AppError(
+                StatusCode::TOO_MANY_REQUESTS,
+                "Verification mail is temporarily full for today. Try again tomorrow".into(),
+            ));
+        }
+    }
+    sqlx::query("DELETE FROM email_verifications WHERE user_id=?")
+        .bind(&u.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    sqlx::query("INSERT INTO email_verifications(token_hash,user_id,expires_at) VALUES (?,?,?)")
+        .bind(auth::token_hash(&token))
+        .bind(&u.id)
+        .bind(expires)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::internal)?;
+    send_verification(&state, &u.email, &token).await?;
+    tx.commit().await.map_err(AppError::internal)?;
+    Ok(msg_redirect("/account", "A new verification link was sent"))
+}
+
+async fn report_route(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    csrf(&headers, &form, &v, &state)?;
+    let r = get_route(&state.pool, &slug).await?;
+    if r.visibility == "private" {
+        return Err(AppError::not_found());
+    }
+    let reason = val(&form, "reason");
+    if !valid_choice(reason, &["misleading", "copyright", "unsafe", "other"]) {
+        return Err(AppError::bad("Choose a report reason"));
+    }
+    let details = val(&form, "details").trim();
+    if details.len() > 1000 {
+        return Err(AppError::bad("Report details are too long"));
+    }
+    sqlx::query(
+        "INSERT INTO route_reports(id,route_id,reporter_id,reason,details) VALUES (?,?,?,?,?)",
+    )
+    .bind(Uuid::new_v4().to_string())
+    .bind(&r.id)
+    .bind(v.user.as_ref().map(|u| u.id.as_str()))
+    .bind(reason)
+    .bind(details)
+    .execute(&state.pool)
+    .await
+    .map_err(AppError::internal)?;
+    Ok(msg_redirect(
+        &format!("/routes/{slug}"),
+        "Report received. Thank you",
+    ))
+}
+async fn admin(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let u = require_user(&v)?;
+    if u.is_admin == 0 {
+        return Err(AppError::forbidden());
+    }
+    let users:Vec<User>=sqlx::query_as("SELECT id,username,email,bio,avatar_key,email_verified_at,contributor_verified_at,is_admin FROM users ORDER BY created_at DESC LIMIT 100")
+        .fetch_all(&state.pool).await.map_err(AppError::internal)?;
+    let reports:Vec<(String,String,String,String,String,String)>=sqlx::query_as("SELECT rr.id,r.slug,r.title,rr.reason,rr.details,rr.status FROM route_reports rr JOIN routes r ON r.id=rr.route_id ORDER BY rr.created_at DESC LIMIT 100")
+        .fetch_all(&state.pool).await.map_err(AppError::internal)?;
+    let total_users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
+        .fetch_one(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    let total_routes: i64 = sqlx::query_scalar("SELECT count(*) FROM routes")
+        .fetch_one(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    let open_reports: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM route_reports WHERE status='open'")
+            .fetch_one(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    let mut data = base_context(&state, &v, "Administration", "admin");
+    data["stats"] = json!({"users":total_users,"routes":total_routes,"reports":open_reports});
+    data["users"]=json!(users.iter().map(|u|json!({"id":u.id,"username":u.username,"email":u.email,"email_verified":u.email_verified_at.is_some(),"contributor":u.contributor_verified_at.is_some()})).collect::<Vec<_>>());
+    data["reports"]=json!(reports.iter().map(|(id,slug,title,reason,details,status)|json!({"id":id,"slug":slug,"title":title,"reason":reason,"details":details,"status":status,"open":status=="open"})).collect::<Vec<_>>());
+    render(&state, v, data)
+}
+async fn admin_contributor(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let u = require_user(&v)?;
+    if u.is_admin == 0 {
+        return Err(AppError::forbidden());
+    }
+    csrf(&headers, &form, &v, &state)?;
+    let verified = val(&form, "verified") == "true";
+    sqlx::query("UPDATE users SET contributor_verified_at=CASE WHEN ? THEN datetime('now') ELSE NULL END WHERE id=? AND email_verified_at IS NOT NULL")
+        .bind(verified).bind(&id).execute(&state.pool).await.map_err(AppError::internal)?;
+    Ok(redirect("/admin"))
+}
+async fn admin_report(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let u = require_user(&v)?;
+    if u.is_admin == 0 {
+        return Err(AppError::forbidden());
+    }
+    csrf(&headers, &form, &v, &state)?;
+    let action = val(&form, "action");
+    let route_id: Option<String> =
+        sqlx::query_scalar("SELECT route_id FROM route_reports WHERE id=?")
+            .bind(&id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::internal)?;
+    let route_id = route_id.ok_or_else(AppError::not_found)?;
+    match action {
+        "dismiss" => {
+            sqlx::query("UPDATE route_reports SET status='dismissed' WHERE id=?")
+                .bind(&id)
+                .execute(&state.pool)
+                .await
+                .map_err(AppError::internal)?;
+        }
+        "remove" => {
+            let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
+            sqlx::query(
+                "UPDATE routes SET visibility='private',updated_at=datetime('now') WHERE id=?",
+            )
+            .bind(&route_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::internal)?;
+            sqlx::query("UPDATE route_reports SET status='removed' WHERE id=?")
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(AppError::internal)?;
+            tx.commit().await.map_err(AppError::internal)?;
+        }
+        _ => return Err(AppError::bad("Unknown moderation action")),
+    }
+    Ok(redirect("/admin"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{body::to_bytes, http::Request};
+    use tower::ServiceExt;
+
+    async fn setup() -> (Router, Shared, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_url = format!("sqlite://{}", dir.path().join("test.db").display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(
+                SqliteConnectOptions::from_str(&db_url)
+                    .unwrap()
+                    .create_if_missing(true),
+            )
+            .await
+            .unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let storage = dir.path().join("files");
+        tokio::fs::create_dir_all(&storage).await.unwrap();
+        let mut templates = Handlebars::new();
+        handlebars::handlebars_helper!(eq: |a: str, b: str| a == b);
+        templates.register_helper("eq", Box::new(eq));
+        templates
+            .register_template_string("page", include_str!("../../templates/page.hbs"))
+            .unwrap();
+        let state = Arc::new(AppState {
+            pool,
+            templates,
+            storage,
+            base_url: "http://localhost".into(),
+            map_style: "/static/map-style.json".into(),
+            secure_cookie: false,
+            brevo_api_key: None,
+            mail_from: None,
+        });
+        (router(state.clone()), state, dir)
+    }
+    async fn send(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        body: Body,
+        content_type: Option<&str>,
+        cookie: Option<&str>,
+    ) -> Response {
+        let mut req = Request::builder().method(method).uri(uri);
+        if let Some(ct) = content_type {
+            req = req.header(header::CONTENT_TYPE, ct);
+        }
+        if let Some(c) = cookie {
+            req = req.header(header::COOKIE, c);
+        }
+        app.clone().oneshot(req.body(body).unwrap()).await.unwrap()
+    }
+    fn field(html: &str, name: &str) -> String {
+        let marker = format!("name=\"{name}\" value=\"");
+        html.split(&marker)
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+    #[tokio::test]
+    async fn public_pages_render_and_route_privacy_is_enforced() {
+        let (app, state, _dir) = setup().await;
+        let home = send(&app, "GET", "/", Body::empty(), None, None).await;
+        assert_eq!(home.status(), StatusCode::OK);
+        let body = to_bytes(home.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Go a little further"));
+        if let Ok(path) = std::env::var("PREVIEW_OUT") {
+            let html = String::from_utf8_lossy(&body).replace("/static/", "static/");
+            std::fs::write(path, html).unwrap();
+        }
+        let register = send(&app, "GET", "/register", Body::empty(), None, None).await;
+        assert_eq!(register.status(), StatusCode::OK);
+        let cookie = register.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        let html = String::from_utf8(
+            to_bytes(register.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let csrf = field(&html, "csrf");
+        let form=format!("csrf={csrf}&username=test_rider&email=test%40example.com&password=a+very+long+test+password");
+        let registered = send(
+            &app,
+            "POST",
+            "/register",
+            Body::from(form),
+            Some("application/x-www-form-urlencoded"),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(registered.status(), StatusCode::SEE_OTHER);
+        let session = registered.headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned();
+        sqlx::query(
+            "UPDATE users SET email_verified_at=datetime('now') WHERE username='test_rider'",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        let upload_page = send(&app, "GET", "/upload", Body::empty(), None, Some(&session)).await;
+        assert_eq!(upload_page.status(), StatusCode::OK);
+        let html = String::from_utf8(
+            to_bytes(upload_page.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap();
+        let csrf = field(&html, "csrf");
+        let gpx="<gpx><trk><trkseg><trkpt lat=\"25\" lon=\"121\"><ele>5</ele></trkpt><trkpt lat=\"25.01\" lon=\"121.01\"><ele>25</ele></trkpt><trkpt lat=\"25.02\" lon=\"121.02\"><ele>40</ele></trkpt><trkpt lat=\"25.03\" lon=\"121.03\"><ele>20</ele></trkpt></trkseg></trk></gpx>";
+        let mut multipart = String::new();
+        for (k, value) in [
+            ("csrf", csrf.as_str()),
+            ("title", "Taipei Test Ride"),
+            ("description", "A synthetic route"),
+            ("cycling_type", "road"),
+            ("region", "Taipei"),
+            ("country", "Taiwan"),
+            ("difficulty", "easy"),
+            ("tags", "river"),
+            ("visibility", "private"),
+            ("hide_endpoints", "250"),
+        ] {
+            multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{value}\r\n"));
+        }
+        multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"gpx\"; filename=\"ride.gpx\"\r\nContent-Type: application/gpx+xml\r\n\r\n{gpx}\r\n--test-boundary--\r\n"));
+        let uploaded = send(
+            &app,
+            "POST",
+            "/upload",
+            Body::from(multipart),
+            Some("multipart/form-data; boundary=test-boundary"),
+            Some(&session),
+        )
+        .await;
+        assert_eq!(uploaded.status(), StatusCode::SEE_OTHER);
+        let location = uploaded.headers()[header::LOCATION].to_str().unwrap();
+        let private = send(&app, "GET", location, Body::empty(), None, None).await;
+        assert_eq!(private.status(), StatusCode::NOT_FOUND);
+        let owner = send(&app, "GET", location, Body::empty(), None, Some(&session)).await;
+        assert_eq!(owner.status(), StatusCode::OK);
+        let geometry = send(
+            &app,
+            "GET",
+            &format!("{location}/geometry"),
+            Body::empty(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(geometry.status(), StatusCode::NOT_FOUND);
+        let owner_download = send(
+            &app,
+            "GET",
+            &format!("{location}/download"),
+            Body::empty(),
+            None,
+            Some(&session),
+        )
+        .await;
+        assert_eq!(owner_download.status(), StatusCode::OK);
+        let bytes = to_bytes(owner_download.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), gpx.as_bytes());
+    }
+}

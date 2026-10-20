@@ -1,0 +1,568 @@
+# Build a Community-Driven GPX Route Sharing Platform Using Rust
+
+## 1. Project Overview
+
+Help me design and build a **public GPX route-sharing platform**, initially focused on cycling routes but designed to support other outdoor activities in the future.
+
+The idea comes from my personal need to store, manage, and share GPX routes from my cycling activities. However, I want to make the platform accessible to everyone, allowing users to discover, upload, manage, and share interesting or unique routes they have explored.
+
+My main inspirations are:
+
+- **CariRute:** https://gpx.ai.id/
+- **Komoot:** https://www.komoot.com/
+
+I want the platform to provide functionality similar to CariRute for the initial MVP, while taking inspiration from Komoot's map visualization, route presentation, and overall user experience.
+
+However, **I do not want to build a full social media platform like Komoot**, at least not initially.
+
+The main focus should be:
+
+- Discovering interesting cycling routes
+- Sharing personal GPX routes with the community
+- Displaying routes on interactive maps
+- Providing useful route information
+- Allowing users to download GPX files
+- Maintaining public user profiles
+- Creating a pleasant and intuitive user experience
+
+The platform should be lightweight, performant, maintainable, and expandable.
+
+---
+
+## 2. Technology Stack and Architecture
+
+I want to use this project as an opportunity to **learn Rust through building a real-world application**.
+
+My initial preference is:
+
+- **Rust** as the primary programming language
+- **Leptos** as the full-stack web framework
+
+However, I am open to brainstorming and evaluating other Rust-based technologies if they provide meaningful benefits.
+
+Before beginning implementation, evaluate suitable options, including:
+
+- Leptos full-stack with SSR
+- Leptos with Axum
+- Axum backend with a separate frontend
+- Other relevant Rust frameworks or libraries
+
+Compare them based on:
+
+1. Learning curve for someone familiar with backend engineering but relatively new to Rust
+2. Development experience and maintainability
+3. Performance and resource efficiency
+4. Server-side rendering and SEO capabilities
+5. Integration with interactive mapping libraries
+6. Authentication and database support
+7. Deployment complexity
+8. Long-term scalability
+
+I prefer keeping as much of the application in Rust as reasonably possible, but I am comfortable using JavaScript or TypeScript for functionality where the Rust ecosystem is less mature, especially interactive maps.
+
+**Do not force an entirely Rust-based implementation if doing so introduces unnecessary complexity.**
+
+### Additional Technology Considerations
+
+Please evaluate and recommend suitable technologies for:
+
+- Database: PostgreSQL or SQLite
+- Database access: SQLx or another appropriate Rust library
+- GPX parsing and processing
+- Interactive maps: MapLibre GL JS, Leaflet, or other alternatives
+- Map tiles and geographic data: OpenStreetMap or compatible providers
+- File storage: local filesystem initially, with future object-storage compatibility
+- Authentication and user management
+- Image upload and optimization
+- UI component systems and styling
+- Testing and deployment
+
+Explain your recommendations and trade-offs before implementation.
+
+---
+
+## 3. Core Features — MVP
+
+### 3.1 User Authentication and Profiles
+
+Users should be able to register, authenticate, and manage their accounts.
+
+Required functionality:
+
+- User registration and login
+- Secure authentication
+- Email verification
+- User profile management
+- Unique public username
+- Profile picture
+- Short biography
+- Public list of uploaded routes
+- Account settings
+
+Each user should have a public profile accessible through a shareable URL.
+
+Example:
+
+`/users/username`
+
+### Verified Profiles
+
+The platform should distinguish between:
+
+- **Email-verified users:** Users who have verified their email addresses
+- **Verified contributors:** Users manually approved by administrators as trusted route contributors
+
+Verified contributors may receive a visible verification badge.
+
+For the MVP, contributor verification can be handled manually by administrators.
+
+Do not automatically grant a trusted-contributor badge just because someone has verified their email.
+
+### 3.2 Route Management — CRUD
+
+Authenticated users should be able to create, view, update, and delete their own routes.
+
+Each route should contain:
+
+- Route title
+- Short description
+- GPX file
+- Route category
+- Cycling type
+- Location or region
+- Country
+- Distance
+- Elevation gain and loss, when available
+- Estimated or recorded duration, when available
+- Difficulty level
+- Route cover image (optional)
+- Additional photos (optional)
+- Route tags
+- Visibility status: public, unlisted, or private
+- Creation and update timestamps
+- Route author
+
+Suggested cycling types:
+
+- Road Cycling
+- Gravel Cycling
+- Mountain Biking
+- Bike Touring
+- Bikepacking
+- Urban Cycling
+- Mixed Terrain
+
+The classification should be designed so other activities, such as hiking or trail running, can be introduced later.
+
+### 3.3 GPX Upload and Processing
+
+Allow users to upload GPX files directly.
+
+The application should:
+
+1. Validate the uploaded GPX file.
+2. Parse its tracks, routes, and geographic coordinates.
+3. Extract available metadata.
+4. Calculate total distance based on route geometry.
+5. Calculate elevation statistics when elevation data is available.
+6. Extract duration when suitable timestamp data exists.
+7. Generate an appropriate map preview.
+8. Store the original GPX file.
+9. Persist the extracted route metadata in the database.
+
+The system must handle incomplete or malformed GPX files gracefully.
+
+For example:
+
+- Missing elevation data should not cause upload failure.
+- Missing timestamps should not produce invented duration statistics.
+- Multiple track segments should be handled correctly.
+- Route distance should be calculated without incorrectly connecting unrelated track segments.
+
+Do not invent metrics that cannot be derived reliably from the GPX file.
+
+Implement file size limits, secure file handling, and basic duplicate detection.
+
+### 3.4 Interactive Route Visualization
+
+**The interactive map is one of the most important features of this platform.**
+
+Users should be able to inspect routes directly from the browser.
+
+The map should support:
+
+- Zooming
+- Panning
+- Route polyline rendering
+- Start and finish markers
+- Automatic map bounds fitting
+- Fullscreen map view
+- Responsive interaction on mobile devices
+- Alternative map styles, where supported
+
+If elevation data is available, display an interactive elevation profile.
+
+Ideally, users should be able to hover over an elevation chart and see the corresponding position on the route.
+
+The map should feel smooth and responsive, even when handling relatively large GPX files.
+
+Evaluate whether route geometry should be simplified for rendering while preserving the original GPX file for downloads.
+
+### 3.5 Route Discovery
+
+Create a public route discovery page where users can browse routes uploaded by the community.
+
+The discovery page should have:
+
+- Search by route title
+- Search or filtering by region
+- Filtering by cycling type
+- Filtering by difficulty
+- Filtering by distance range
+- Sorting by newest or popularity
+- Pagination
+
+Each route should have a visually appealing preview card displaying:
+
+- Route preview map or cover image
+- Route title
+- Region
+- Distance
+- Elevation gain, if available
+- Cycling category
+- Author information
+- Download count, if tracked
+
+Prioritize discoverability rather than social engagement.
+
+### 3.6 Route Detail Page
+
+Each public route should have its own dedicated page with a shareable URL.
+
+Example:
+
+`/routes/taipei-riverside-loop`
+
+The page should display:
+
+- Route title
+- Description
+- Interactive map
+- Route statistics
+- Elevation profile, when available
+- Cycling category
+- Region
+- Route photos
+- Author information
+- GPX download button
+- Share button
+
+Use human-readable, unique route slugs.
+
+The page should also include appropriate SEO metadata and Open Graph information for link sharing.
+
+### 3.7 GPX Download and Sharing
+
+Public routes should be downloadable without requiring an account.
+
+Features:
+
+- Download original GPX
+- Copy shareable route URL
+- Share using native sharing functionality when available
+- Basic download count
+
+The platform should clearly identify the original uploader and encourage proper attribution.
+
+### 3.8 Personal Dashboard
+
+Authenticated users should have a simple dashboard to manage their uploaded routes.
+
+The dashboard should include:
+
+- Total routes uploaded
+- Total distance across uploaded routes
+- Number of public and private routes
+- Total downloads
+- Recently uploaded routes
+- Route management table
+- Add new route button
+
+Keep the dashboard simple and avoid unnecessary analytics.
+
+### 3.9 Administration and Moderation
+
+Create a minimal administration interface for:
+
+- Managing users
+- Reviewing reported routes
+- Removing inappropriate or unauthorized content
+- Managing verified contributor status
+- Viewing basic platform statistics
+
+Users should be able to report routes containing misleading information, copyrighted material, or unsafe content.
+
+---
+
+## 4. User Interface and User Experience
+
+I want the platform to have a **modern, distinctive, clean, and functional design**.
+
+Avoid making it look like a conventional social media feed.
+
+The product should feel like a dedicated route exploration and sharing tool.
+
+### Design Principles
+
+- Map-first interface
+- Clean typography
+- Good visual hierarchy
+- Minimal visual clutter
+- Modern card layouts
+- Responsive layouts
+- Accessible interactive components
+- Consistent spacing and navigation
+- Light and dark themes, if reasonable
+
+The UI should work well on both desktop and mobile browsers.
+
+### Main Pages
+
+Design and implement:
+
+1. Landing / Home page
+2. Explore Routes page
+3. Route Detail page
+4. Upload Route page
+5. Edit Route page
+6. Public User Profile
+7. Personal Dashboard
+8. Login / Registration pages
+9. Account Settings
+10. Basic Admin Dashboard
+
+### UI/UX Skills
+
+If UI/UX design skills or tools are available in your environment, **actively use them** to improve the design and implementation.
+
+Use relevant skills for:
+
+- Visual design
+- Interface architecture
+- Layout composition
+- Responsive design
+- Accessibility
+- Component consistency
+- User interaction design
+
+Do not simply generate generic dashboard templates.
+
+Create a visual identity appropriate for an outdoor cycling and exploration platform.
+
+---
+
+## 5. Data Model and Application Architecture
+
+Design an appropriate data model for a multi-user route-sharing platform.
+
+Suggested entities:
+
+- Users
+- User Profiles
+- Routes
+- GPX Files / Route Assets
+- Route Categories
+- Route Images
+- Verified Contributor Requests or Status
+- Route Reports
+- Download Statistics
+
+Adjust, combine, or remove entities where appropriate to avoid overengineering.
+
+The architecture should separate:
+
+- Presentation layer
+- Application / business logic
+- Domain models
+- Data access
+- GPX processing
+- File storage
+
+Use Rust's type system effectively without introducing unnecessary abstractions.
+
+I prefer maintainable, modular code over excessive architectural complexity.
+
+---
+
+## 6. Security, Privacy, and Performance
+
+Because this is a public platform that accepts user-uploaded GPS data, security and privacy are important.
+
+### Security
+
+Implement:
+
+- Secure authentication
+- Authorization for route ownership
+- File upload validation
+- Secure GPX/XML parsing
+- Input validation
+- Appropriate upload limits
+- Rate limiting where necessary
+- Protection against common web vulnerabilities
+
+### Privacy
+
+Users should control whether their routes are:
+
+- Public
+- Unlisted
+- Private
+
+Do not expose private routes through public APIs, search results, or predictable file URLs.
+
+Consider GPS privacy risks, particularly when a route starts or finishes near someone's home.
+
+Evaluate privacy-preserving options such as hiding route endpoints before public sharing.
+
+### Performance
+
+Optimize for:
+
+- Fast route discovery
+- Efficient GPX parsing
+- Responsive map rendering
+- Database query efficiency
+- Pagination
+- Efficient storage
+- Minimal server resource usage
+
+The initial application should be practical to host on a relatively affordable server.
+
+---
+
+## 7. Future Features — Not Required for MVP
+
+Keep the architecture open to future functionality, but do not implement these prematurely.
+
+Possible future features:
+
+- Bookmarking or saving favorite routes
+- Route collections
+- Route comparison
+- Geographic proximity search
+- Route drawing or editing
+- Importing routes from external platforms
+- Discovering nearby routes
+- Advanced elevation analytics
+- Surface-type information
+- Community comments
+- Route recommendations
+- Mobile/PWA support
+
+For now, prioritize a polished and functional GPX-sharing experience.
+
+Avoid implementing advanced navigation, turn-by-turn guidance, or a full social networking system during the MVP.
+
+---
+
+## 8. Implementation and Learning Requirements
+
+Since learning Rust is one of my primary motivations, I want this project to be both a functional application and a practical learning experience.
+
+Please:
+
+- Explain important Rust concepts introduced by the implementation.
+- Highlight ownership, borrowing, lifetimes, traits, and error handling when relevant.
+- Explain why specific crates are selected.
+- Use idiomatic Rust.
+- Avoid unnecessary abstraction and overengineering.
+- Include meaningful error handling and validation.
+- Use reusable components.
+- Introduce automated tests for important business logic.
+- Keep external services and dependencies manageable.
+
+Assume I am an experienced backend developer but still learning Rust.
+
+Do not oversimplify the implementation, but explain unfamiliar Rust-specific patterns when necessary.
+
+---
+
+## 9. Expected Deliverables
+
+### Phase 1 — Research and Architecture
+
+Before writing implementation code:
+
+1. Analyze the two reference platforms.
+2. Identify the essential MVP functionality.
+3. Compare suitable Rust frameworks and tools.
+4. Recommend the most appropriate technology stack.
+5. Propose the database schema.
+6. Outline the overall application architecture.
+7. Define the primary user flows.
+8. Create a practical implementation roadmap.
+
+Explain the major trade-offs, especially where choosing a Rust-only solution would complicate development.
+
+### Phase 2 — UI/UX Design
+
+Create:
+
+- Information architecture
+- Main page layouts
+- Reusable design components
+- Route discovery interface
+- Interactive map experience
+- Upload workflow
+- Responsive layouts
+
+Use available design skills and established UI/UX practices.
+
+### Phase 3 — Implementation
+
+Implement the application incrementally, including:
+
+- Project setup
+- Database and migrations
+- Authentication
+- User profiles
+- Route CRUD
+- GPX parsing and storage
+- Interactive maps
+- Route discovery
+- Route detail pages
+- Download functionality
+- Administration
+- Tests and documentation
+
+### Phase 4 — Deployment
+
+Provide:
+
+- Environment configuration
+- Database setup instructions
+- Local development instructions
+- Docker or equivalent deployment configuration
+- Production build instructions
+- File storage considerations
+- Backup and recovery recommendations
+
+---
+
+## 10. Final Expectations
+
+Build a platform that is:
+
+- Simple enough to maintain as an individual developer
+- Useful for real cyclists and outdoor enthusiasts
+- Primarily Rust-based
+- Visually polished
+- Fast and resource-efficient
+- Secure and privacy-conscious
+- Ready for public use
+- Extensible without unnecessary complexity
+
+**Most importantly, prioritize delivering a complete, well-designed MVP over implementing too many features.**
+
+Start with architecture and technology recommendations, then proceed with an incremental implementation based on the recommended approach.

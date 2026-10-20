@@ -1,0 +1,15 @@
+# Starter list of known temporary mailbox providers. Update with scripts/update-disposable-domains.sh.
+10minutemail.com
+dispostable.com
+getnada.com
+grr.la
+guerrillamail.com
+guerrillamailblock.com
+maildrop.cc
+mailinator.com
+sharklasers.com
+temp-mail.org
+tempmail.com
+throwawaymail.com
+trashmail.com
+yopmail.com

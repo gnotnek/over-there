@@ -1,0 +1,12 @@
+/target
+/data
+/.env
+/.taste-skill/
+/preview.html
+/skills-lock.json
+/.agents/
+/.codex/
+/.claude/
+/skills/
+**/__pycache__/
+.DS_Store
