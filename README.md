@@ -46,4 +46,6 @@ The included raster OSM style is for local development. Public traffic should us
 
 MIT. See [LICENSE](LICENSE).
 
+The two cycling photos in `static/images/` were generated for this project and are included with the source.
+
 To publish the source under your GitHub account, run `bash scripts/publish-github.sh`. It signs in with GitHub CLI if needed, initializes the local Git history, and creates or pushes the public `gnotnek/over-there` repository.

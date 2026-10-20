@@ -41,7 +41,7 @@ The uploader controls endpoint hiding before public sharing. When enabled, a pub
 2. Contributor: register → verify email → upload GPX → review computed metrics and privacy → publish → dashboard/edit.
 3. Moderator: admin report queue → inspect route → remove content or dismiss → manage contributor badge.
 
-Navigation has Explore, Share a route, Dashboard (when signed in), and account access. The landing page uses the route cue sheet as its visual object; the route trace is the distinctive graphic. The working screens use a quiet green tinted frame around a white map and content sheet. Reusable elements are the navigation shell, route preview, metric row, state label, form field, map, and elevation profile. On phones, the explore filters become a stacked form and the map precedes route details.
+Navigation has Explore, Share, Dashboard (when signed in), and account access. The landing page uses a cycling photo in a route field note and a second wide ride photo, with short copy. The five brand colors are `#006D77`, `#83C5BE`, `#EDF6F9`, `#FFDDD2`, and `#E29578`; text and borders use accessible shades derived from them. Route previews still come from each GPX or contributor photo. Reusable elements are the navigation shell, route preview, metric row, state label, form field, map, and elevation profile. On phones, the explore filters become a stacked form and the map precedes route details.
 
 ## Delivery order and deployment
 
