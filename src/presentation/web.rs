@@ -144,6 +144,13 @@ fn val<'a>(form: &'a HashMap<String, String>, name: &str) -> &'a str {
 }
 /// Routes an account without a verified email may publish per rolling day.
 const UNVERIFIED_DAILY_ROUTES: i64 = 5;
+fn daily_limit_reached() -> AppError {
+    AppError(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Unverified accounts can share 5 routes a day. Verify your email to remove the limit"
+            .into(),
+    )
+}
 /// Rejects forms whose hidden `website` field was filled, which people never see but bots do.
 fn honeypot(form: &HashMap<String, String>) -> Result<(), AppError> {
     if val(form, "website").is_empty() {
@@ -1054,7 +1061,9 @@ async fn upload(
     let (form, mut files) = multipart_values(multipart).await?;
     csrf(&headers, &form, &v, &state)?;
     honeypot(&form)?;
-    if user.email_verified_at.is_none() {
+    let verified = user.email_verified_at.is_some();
+    // Cheap early rejection; the insert below enforces the limit atomically.
+    if !verified {
         let today: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM routes WHERE author_id=? AND created_at>datetime('now','-1 day')",
         )
@@ -1063,11 +1072,7 @@ async fn upload(
         .await
         .map_err(AppError::internal)?;
         if today >= UNVERIFIED_DAILY_ROUTES {
-            return Err(AppError(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Unverified accounts can share 5 routes a day. Verify your email to remove the limit"
-                    .into(),
-            ));
+            return Err(daily_limit_reached());
         }
     }
     let draft = RouteDraft::from_fields(&form).map_err(AppError::bad)?;
@@ -1118,20 +1123,24 @@ async fn upload(
         .as_ref()
         .map(|e| serde_json::to_string(e).unwrap());
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
-    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon) VALUES (?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon) SELECT ?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ? OR (SELECT count(*) FROM routes WHERE author_id=? AND created_at>datetime('now','-1 day'))<?")
         .bind(&id).bind(&user.id).bind(&slug).bind(&draft.title).bind(&draft.description)
         .bind(&draft.cycling_type).bind(&draft.region).bind(&draft.country)
         .bind(&draft.difficulty).bind(&draft.tags).bind(draft.visibility_str())
         .bind(&gpx_key).bind(&public_gpx_key).bind(&sha).bind(hide).bind(&geometry).bind(&elevation)
         .bind(parsed.distance_m).bind(parsed.gain_m).bind(parsed.loss_m).bind(parsed.duration_s).bind(&cover_key)
         .bind(route_box.map(|b| b.min_lat)).bind(route_box.map(|b| b.max_lat)).bind(route_box.map(|b| b.min_lon)).bind(route_box.map(|b| b.max_lon))
+        .bind(verified).bind(&user.id).bind(UNVERIFIED_DAILY_ROUTES)
         .execute(&mut *tx).await;
-    if let Err(e) = result {
+    if !matches!(result, Ok(ref done) if done.rows_affected() == 1) {
         let written = [Some(gpx_key), public_gpx_key, cover_key]
             .into_iter()
             .flatten();
         remove_assets(&state, written.chain(photo_keys)).await;
-        return Err(AppError::internal(e));
+        return Err(match result {
+            Err(e) => AppError::internal(e),
+            Ok(_) => daily_limit_reached(),
+        });
     }
     for (position, key) in photo_keys.iter().enumerate() {
         sqlx::query("INSERT INTO route_images(id,route_id,image_key,position) VALUES (?,?,?,?)")
@@ -1711,6 +1720,32 @@ mod tests {
         let gpx = TAIPEI_GPX.replace("<ele>5</ele>", "<ele>9</ele>");
         let sixth = post_upload(&app, &session, "Daily Ride", &gpx, "public", "easy", "").await;
         assert_eq!(sixth.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn concurrent_uploads_cannot_pass_the_daily_limit() {
+        let (app, state, _dir) = setup().await;
+        let session = unverified_rider(&app).await;
+        let mut uploads = tokio::task::JoinSet::new();
+        for i in 0..8 {
+            let (app, session) = (app.clone(), session.clone());
+            let gpx = TAIPEI_GPX.replace("<ele>5</ele>", &format!("<ele>{i}</ele>"));
+            uploads.spawn(async move {
+                post_upload(&app, &session, "Burst Ride", &gpx, "public", "easy", "")
+                    .await
+                    .status()
+            });
+        }
+        let statuses = uploads.join_all().await;
+        let published = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::SEE_OTHER)
+            .count();
+        assert_eq!(published, 5);
+        assert_eq!(count(&state, "SELECT count(*) FROM routes").await, 5);
+        assert!(statuses
+            .iter()
+            .all(|s| *s == StatusCode::SEE_OTHER || *s == StatusCode::TOO_MANY_REQUESTS));
     }
 
     #[tokio::test]
