@@ -1,6 +1,6 @@
 # Phase 2: Routes near me
 
-Status: design agreed, not started. Part of the [roadmap](../roadmap.md).
+Status: done. Part of the [roadmap](../roadmap.md).
 
 ## Why
 
