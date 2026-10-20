@@ -142,6 +142,23 @@ fn csrf(
 fn val<'a>(form: &'a HashMap<String, String>, name: &str) -> &'a str {
     form.get(name).map(String::as_str).unwrap_or("")
 }
+/// Routes an account without a verified email may publish per rolling day.
+const UNVERIFIED_DAILY_ROUTES: i64 = 5;
+fn daily_limit_reached() -> AppError {
+    AppError(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Unverified accounts can share 5 routes a day. Verify your email to remove the limit"
+            .into(),
+    )
+}
+/// Rejects forms whose hidden `website` field was filled, which people never see but bots do.
+fn honeypot(form: &HashMap<String, String>) -> Result<(), AppError> {
+    if val(form, "website").is_empty() {
+        return Ok(());
+    }
+    tracing::warn!("honeypot field filled, form rejected");
+    Err(AppError::bad("Unable to submit this form"))
+}
 fn escape(input: &str) -> String {
     input
         .replace('&', "&amp;")
@@ -756,6 +773,7 @@ async fn register(
 ) -> WebResult {
     let v = viewer(&state, &headers).await;
     csrf(&headers, &form, &v, &state)?;
+    honeypot(&form)?;
     let username = val(&form, "username").trim().to_ascii_lowercase();
     let email = val(&form, "email").trim().to_ascii_lowercase();
     let password = val(&form, "password");
@@ -784,35 +802,42 @@ async fn register(
         .execute(&mut *tx)
         .await
         .map_err(|_| AppError::bad("Username or email is already in use"))?;
-    let verification = auth::random_token();
-    let expires = (chrono::Utc::now() + chrono::Duration::days(2))
-        .format("%Y-%m-%d %H:%M:%S")
-        .to_string();
-    sqlx::query("INSERT INTO email_verifications(token_hash,user_id,expires_at) VALUES (?,?,?)")
+    let mut mail_available = true;
+    if state.brevo_api_key.is_some() {
+        let quota=sqlx::query("INSERT INTO email_send_quota(day,sent) VALUES (date('now'),1) ON CONFLICT(day) DO UPDATE SET sent=sent+1 WHERE sent<250")
+            .execute(&mut *tx).await.map_err(AppError::internal)?;
+        mail_available = quota.rows_affected() > 0;
+    }
+    // Verification is optional, so a full mail quota only skips the email, never the account.
+    if mail_available {
+        let verification = auth::random_token();
+        let expires = (chrono::Utc::now() + chrono::Duration::days(2))
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+        sqlx::query(
+            "INSERT INTO email_verifications(token_hash,user_id,expires_at) VALUES (?,?,?)",
+        )
         .bind(auth::token_hash(&verification))
         .bind(&id)
         .bind(expires)
         .execute(&mut *tx)
         .await
         .map_err(AppError::internal)?;
-    if state.brevo_api_key.is_some() {
-        let quota=sqlx::query("INSERT INTO email_send_quota(day,sent) VALUES (date('now'),1) ON CONFLICT(day) DO UPDATE SET sent=sent+1 WHERE sent<250")
-            .execute(&mut *tx).await.map_err(AppError::internal)?;
-        if quota.rows_affected() == 0 {
-            tracing::warn!("daily verification email quota reached");
-            return Err(AppError(
-                StatusCode::TOO_MANY_REQUESTS,
-                "Registration is temporarily full for today. Try again tomorrow".into(),
-            ));
-        }
+        send_verification(&state, &email, &verification).await?;
+    } else {
+        tracing::warn!(user_id = %id, "daily verification email quota reached, email skipped");
     }
-    send_verification(&state, &email, &verification).await?;
     tx.commit().await.map_err(AppError::internal)?;
     let (token, _) = auth::create_session(&state.pool, &id)
         .await
         .map_err(AppError::internal)?;
     tracing::info!(user_id = %id, "account registered");
-    let mut response = msg_redirect("/dashboard", "Check your email to verify your address");
+    let notice = if mail_available {
+        "Welcome! Verify your email any time to lift the daily route limit"
+    } else {
+        "Welcome! Our verification mail is full today. Resend it from Account settings tomorrow"
+    };
+    let mut response = msg_redirect("/dashboard", notice);
     response.headers_mut().append(
         header::SET_COOKIE,
         HeaderValue::from_str(&auth::session_cookie(&token, state.secure_cookie))
@@ -1033,11 +1058,23 @@ async fn upload(
 ) -> WebResult {
     let v = viewer(&state, &headers).await;
     let user = require_user(&v)?;
-    if user.email_verified_at.is_none() {
-        return Err(AppError::forbidden());
-    }
     let (form, mut files) = multipart_values(multipart).await?;
     csrf(&headers, &form, &v, &state)?;
+    honeypot(&form)?;
+    let verified = user.email_verified_at.is_some();
+    // Cheap early rejection; the insert below enforces the limit atomically.
+    if !verified {
+        let today: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM routes WHERE author_id=? AND created_at>datetime('now','-1 day')",
+        )
+        .bind(&user.id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+        if today >= UNVERIFIED_DAILY_ROUTES {
+            return Err(daily_limit_reached());
+        }
+    }
     let draft = RouteDraft::from_fields(&form).map_err(AppError::bad)?;
     let raw = files
         .remove("gpx")
@@ -1086,20 +1123,24 @@ async fn upload(
         .as_ref()
         .map(|e| serde_json::to_string(e).unwrap());
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
-    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon) VALUES (?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon) SELECT ?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ? OR (SELECT count(*) FROM routes WHERE author_id=? AND created_at>datetime('now','-1 day'))<?")
         .bind(&id).bind(&user.id).bind(&slug).bind(&draft.title).bind(&draft.description)
         .bind(&draft.cycling_type).bind(&draft.region).bind(&draft.country)
         .bind(&draft.difficulty).bind(&draft.tags).bind(draft.visibility_str())
         .bind(&gpx_key).bind(&public_gpx_key).bind(&sha).bind(hide).bind(&geometry).bind(&elevation)
         .bind(parsed.distance_m).bind(parsed.gain_m).bind(parsed.loss_m).bind(parsed.duration_s).bind(&cover_key)
         .bind(route_box.map(|b| b.min_lat)).bind(route_box.map(|b| b.max_lat)).bind(route_box.map(|b| b.min_lon)).bind(route_box.map(|b| b.max_lon))
+        .bind(verified).bind(&user.id).bind(UNVERIFIED_DAILY_ROUTES)
         .execute(&mut *tx).await;
-    if let Err(e) = result {
+    if !matches!(result, Ok(ref done) if done.rows_affected() == 1) {
         let written = [Some(gpx_key), public_gpx_key, cover_key]
             .into_iter()
             .flatten();
         remove_assets(&state, written.chain(photo_keys)).await;
-        return Err(AppError::internal(e));
+        return Err(match result {
+            Err(e) => AppError::internal(e),
+            Ok(_) => daily_limit_reached(),
+        });
     }
     for (position, key) in photo_keys.iter().enumerate() {
         sqlx::query("INSERT INTO route_images(id,route_id,image_key,position) VALUES (?,?,?,?)")
@@ -1492,6 +1533,9 @@ mod tests {
     use tower::ServiceExt;
 
     async fn setup() -> (Router, Shared, tempfile::TempDir) {
+        setup_with_mail(None).await
+    }
+    async fn setup_with_mail(brevo_api_key: Option<String>) -> (Router, Shared, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let db_url = format!("sqlite://{}", dir.path().join("test.db").display());
         let pool = SqlitePoolOptions::new()
@@ -1519,7 +1563,7 @@ mod tests {
             base_url: "http://localhost".into(),
             map_style: "/static/map-style.json".into(),
             secure_cookie: false,
-            brevo_api_key: None,
+            brevo_api_key,
             mail_from: None,
         });
         (router(state.clone()), state, dir)
@@ -1564,6 +1608,17 @@ mod tests {
     }
 
     async fn signed_in_rider(app: &Router, state: &Shared) -> String {
+        let session = unverified_rider(app).await;
+        sqlx::query(
+            "UPDATE users SET email_verified_at=datetime('now') WHERE username='test_rider'",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+        session
+    }
+
+    async fn register_rider(app: &Router, extra: &str) -> Response {
         let register = send(app, "GET", "/register", Body::empty(), None, None).await;
         assert_eq!(register.status(), StatusCode::OK);
         let cookie = register.headers()[header::SET_COOKIE]
@@ -1574,8 +1629,8 @@ mod tests {
             .unwrap()
             .to_owned();
         let csrf = field(&body_text(register).await, "csrf");
-        let form = format!("csrf={csrf}&username=test_rider&email=test%40example.com&password=a+very+long+test+password");
-        let registered = send(
+        let form = format!("csrf={csrf}&username=test_rider&email=test%40example.com&password=a+very+long+test+password{extra}");
+        send(
             app,
             "POST",
             "/register",
@@ -1583,22 +1638,19 @@ mod tests {
             Some("application/x-www-form-urlencoded"),
             Some(&cookie),
         )
-        .await;
+        .await
+    }
+
+    async fn unverified_rider(app: &Router) -> String {
+        let registered = register_rider(app, "").await;
         assert_eq!(registered.status(), StatusCode::SEE_OTHER);
-        let session = registered.headers()[header::SET_COOKIE]
+        registered.headers()[header::SET_COOKIE]
             .to_str()
             .unwrap()
             .split(';')
             .next()
             .unwrap()
-            .to_owned();
-        sqlx::query(
-            "UPDATE users SET email_verified_at=datetime('now') WHERE username='test_rider'",
-        )
-        .execute(&state.pool)
-        .await
-        .unwrap();
-        session
+            .to_owned()
     }
 
     async fn upload_route(
@@ -1609,6 +1661,23 @@ mod tests {
         visibility: &str,
         difficulty: &str,
     ) -> String {
+        let uploaded = post_upload(app, session, title, gpx, visibility, difficulty, "").await;
+        assert_eq!(uploaded.status(), StatusCode::SEE_OTHER);
+        uploaded.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    async fn post_upload(
+        app: &Router,
+        session: &str,
+        title: &str,
+        gpx: &str,
+        visibility: &str,
+        difficulty: &str,
+        website: &str,
+    ) -> Response {
         let upload_page = send(app, "GET", "/upload", Body::empty(), None, Some(session)).await;
         assert_eq!(upload_page.status(), StatusCode::OK);
         let csrf = field(&body_text(upload_page).await, "csrf");
@@ -1624,11 +1693,12 @@ mod tests {
             ("tags", "river"),
             ("visibility", visibility),
             ("hide_endpoints", "250"),
+            ("website", website),
         ] {
             multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{value}\r\n"));
         }
         multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"gpx\"; filename=\"ride.gpx\"\r\nContent-Type: application/gpx+xml\r\n\r\n{gpx}\r\n--test-boundary--\r\n"));
-        let uploaded = send(
+        send(
             app,
             "POST",
             "/upload",
@@ -1636,12 +1706,86 @@ mod tests {
             Some("multipart/form-data; boundary=test-boundary"),
             Some(session),
         )
+        .await
+    }
+
+    #[tokio::test]
+    async fn unverified_riders_share_up_to_five_routes_a_day() {
+        let (app, _state, _dir) = setup().await;
+        let session = unverified_rider(&app).await;
+        for i in 0..5 {
+            let gpx = TAIPEI_GPX.replace("<ele>5</ele>", &format!("<ele>{i}</ele>"));
+            upload_route(&app, &session, "Daily Ride", &gpx, "public", "easy").await;
+        }
+        let gpx = TAIPEI_GPX.replace("<ele>5</ele>", "<ele>9</ele>");
+        let sixth = post_upload(&app, &session, "Daily Ride", &gpx, "public", "easy", "").await;
+        assert_eq!(sixth.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn concurrent_uploads_cannot_pass_the_daily_limit() {
+        let (app, state, _dir) = setup().await;
+        let session = unverified_rider(&app).await;
+        let mut uploads = tokio::task::JoinSet::new();
+        for i in 0..8 {
+            let (app, session) = (app.clone(), session.clone());
+            let gpx = TAIPEI_GPX.replace("<ele>5</ele>", &format!("<ele>{i}</ele>"));
+            uploads.spawn(async move {
+                post_upload(&app, &session, "Burst Ride", &gpx, "public", "easy", "")
+                    .await
+                    .status()
+            });
+        }
+        let statuses = uploads.join_all().await;
+        let published = statuses
+            .iter()
+            .filter(|s| **s == StatusCode::SEE_OTHER)
+            .count();
+        assert_eq!(published, 5);
+        assert_eq!(count(&state, "SELECT count(*) FROM routes").await, 5);
+        assert!(statuses
+            .iter()
+            .all(|s| *s == StatusCode::SEE_OTHER || *s == StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[tokio::test]
+    async fn verified_riders_have_no_daily_route_limit() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        for i in 0..6 {
+            let gpx = TAIPEI_GPX.replace("<ele>5</ele>", &format!("<ele>{i}</ele>"));
+            upload_route(&app, &session, "Daily Ride", &gpx, "public", "easy").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn honeypot_rejects_register_and_upload() {
+        let (app, state, _dir) = setup().await;
+        let bot = register_rider(&app, "&website=spam.example").await;
+        assert_eq!(bot.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(count(&state, "SELECT count(*) FROM users").await, 0);
+        let session = unverified_rider(&app).await;
+        let upload = post_upload(
+            &app, &session, "Bot Ride", TAIPEI_GPX, "public", "easy", "x",
+        )
         .await;
-        assert_eq!(uploaded.status(), StatusCode::SEE_OTHER);
-        uploaded.headers()[header::LOCATION]
-            .to_str()
-            .unwrap()
-            .to_owned()
+        assert_eq!(upload.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(count(&state, "SELECT count(*) FROM routes").await, 0);
+    }
+
+    #[tokio::test]
+    async fn signup_succeeds_without_email_when_mail_quota_is_full() {
+        let (app, state, _dir) = setup_with_mail(Some("test-key".into())).await;
+        sqlx::query("INSERT INTO email_send_quota(day,sent) VALUES (date('now'),250)")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        unverified_rider(&app).await;
+        assert_eq!(count(&state, "SELECT count(*) FROM users").await, 1);
+        assert_eq!(
+            count(&state, "SELECT count(*) FROM email_verifications").await,
+            0
+        );
     }
 
     #[tokio::test]

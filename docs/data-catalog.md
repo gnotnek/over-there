@@ -53,7 +53,7 @@ Accounts. Written by `presentation::web` (register, verify, account, admin); rea
 | `password_hash` | TEXT | no | `iterations:salt_hex:hash_hex`, PBKDF2-HMAC-SHA256, 310,000 iterations, 16-byte random salt | Secret |
 | `bio` | TEXT | no | Up to 300 chars, default `''` | Public |
 | `avatar_key` | TEXT | yes | Storage key of a 512 px WebP | Public (via `/users/{username}/avatar`) |
-| `email_verified_at` | TEXT | yes | Set by `/verify/{token}`. Required to upload and to receive the contributor badge | Personal |
+| `email_verified_at` | TEXT | yes | Set by `/verify/{token}`. Optional: without it an account may publish 5 routes per rolling day. Required to receive the contributor badge | Personal |
 | `contributor_verified_at` | TEXT | yes | Badge, set or cleared only by an administrator | Public |
 | `is_admin` | INTEGER | no | 0/1, default 0. There is no UI to change it; set it with `sqlite3` | Personal |
 | `created_at` | TEXT | no | Registration time | Personal |
