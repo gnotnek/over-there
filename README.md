@@ -12,7 +12,7 @@ Over There is an open source GPX route library for cyclists. Riders can discover
 - Route upload, editing, deletion, discovery filters and download counts
 - Reporting and moderation through `/admin`
 
-The product scope and stack decision are documented in [docs/architecture.md](docs/architecture.md). Route planning, comments, collections and navigation are intentionally outside the MVP.
+The product scope and stack decision are documented in [docs/architecture.md](docs/architecture.md). The [docs index](docs/README.md) also lists the data catalog, service catalog, contracts, and a guide to the Rust used in this codebase. Route planning, comments, collections and navigation are intentionally outside the MVP.
 
 ## Local development
 

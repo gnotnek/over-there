@@ -6,6 +6,114 @@ Over There is a public library of GPX routes, starting with cycling. A visitor f
 
 The [Komoot home page](https://www.komoot.com/) demonstrates how activity and destination browsing, map context, route difficulty, and clear route presentation aid discovery. Its planning, navigation, and social features are outside this MVP. The supplied [CariRute URL](https://gpx.ai.id/) was unavailable to the research tool on 20 October 2026, so no specific claim about its current features informs this design.
 
+## System overview
+
+This section is the map of the running system. The rest of this file records the decisions behind it. Reference details live in separate files:
+
+- [data-catalog.md](data-catalog.md): every table, column, stored file and sensitivity class
+- [service-catalog.md](service-catalog.md): every module, browser script and external service, with its interface and failure mode
+- [contracts.md](contracts.md): HTTP endpoints, cookies, CSRF, file formats, template-to-script data and configuration
+
+### Context
+
+```mermaid
+flowchart LR
+    browser["Rider's browser"] -->|HTTPS| proxy["Reverse proxy<br/>TLS, rate limits"]
+    proxy --> app["over-there<br/>single Rust binary"]
+    app --> db[("SQLite<br/>DATABASE_URL")]
+    app --> files[("Private files<br/>STORAGE_DIR")]
+    app -->|verification email| brevo["Brevo API"]
+    browser -->|style and tiles| tiles["Map tile provider"]
+    browser -->|MapLibre JS| cdn["unpkg"]
+    browser -->|fonts| fonts["Google Fonts"]
+```
+
+The server holds all state and renders every page. The browser talks to third parties only for the map library, map tiles and fonts. Tile requests reveal which area a viewer is looking at, including around a private route, so choose a production tile provider whose privacy terms you accept.
+
+### Layers
+
+```mermaid
+flowchart TD
+    main["main.rs"] --> web["presentation::web<br/>router, handlers, rendering, storage, email"]
+    web --> identity["identity<br/>auth, email"]
+    web --> infra["infrastructure<br/>route queries"]
+    web --> domain["domain<br/>route, gpx, nearby"]
+    infra --> domain
+```
+
+The dependency rule: arrows point toward `domain`, never away from it. Domain code takes and returns plain values, so it has no HTTP or SQL and is tested without a server. `identity::auth` is the one deliberate exception below the web layer: it reads cookies from request headers and queries `sessions`, because sessions are meaningless without both.
+
+### Folder structure
+
+```text
+Over-There/
+├── Cargo.toml            # crate name, Rust edition, dependencies
+├── Cargo.lock            # exact dependency versions (committed, used by --locked)
+├── .env.example          # settings read at startup; copy to .env
+├── migrations/           # SQL files applied in filename order on startup
+├── resources/            # data compiled into the binary (disposable email domains)
+├── templates/page.hbs    # the one Handlebars template, with a section per page
+├── static/               # CSS, browser JS (maps, elevation chart), images, map style
+├── scripts/              # helper scripts, not part of the server
+├── docs/                 # architecture, catalogs, contracts, roadmap, specs, plans, Rust guide
+├── data/                 # created at runtime: SQLite DB + uploaded files (never committed)
+└── src/
+    ├── main.rs           # entry point: declares modules and starts the server
+    ├── domain/           # pure business rules, no HTTP and no database
+    │   ├── mod.rs
+    │   ├── gpx.rs        # parse GPX, distance, elevation, endpoint hiding, GeoJSON
+    │   ├── route.rs      # visibility, who may view/edit, form validation, slugs
+    │   └── nearby.rs     # "routes near me": bounding boxes, distance, ranking
+    ├── identity/         # accounts
+    │   ├── mod.rs
+    │   ├── auth.rs       # password hashing, sessions, cookies, CSRF
+    │   └── email.rs      # email validation and the disposable-domain check
+    ├── infrastructure/   # database access for routes
+    │   ├── mod.rs
+    │   └── routes.rs     # RouteRecord and SQLx queries
+    └── presentation/     # the HTTP layer
+        ├── mod.rs
+        └── web.rs        # startup, URL router, handlers, templates, HTTP tests
+```
+
+### Request lifecycle
+
+```mermaid
+sequenceDiagram
+    participant B as Browser
+    participant R as Router (web.rs)
+    participant H as Handler
+    participant A as identity::auth
+    participant I as infrastructure / SQL
+    participant D as domain
+    B->>R: GET /routes/{slug}
+    R->>H: route_detail(State, headers, Path)
+    H->>A: session cookie → viewer
+    H->>I: find_by_slug
+    H->>D: may_view(visibility, owner, viewer)
+    alt not allowed
+        H-->>B: 404 error page
+    else allowed
+        H->>H: build JSON context, render page.hbs
+        H-->>B: 200 HTML
+    end
+```
+
+Every handler follows this shape: identify the viewer, check CSRF on POST, load data, apply a domain rule, then render or redirect. Errors at any step become an `AppError`, which renders as an HTML error page with the right status code.
+
+### Where new work goes
+
+| Adding… | Put it in | Also update |
+| --- | --- | --- |
+| A business rule (validation, access, a calculation) | `src/domain/`, with a unit test | [service-catalog.md](service-catalog.md) |
+| A table or column | A new file in `migrations/` (never edit an applied one) | [data-catalog.md](data-catalog.md) |
+| A page or endpoint | A handler and `.route(...)` in `web.rs`, a `page_*` section in `templates/page.hbs` | [contracts.md](contracts.md) |
+| A reusable query | `src/infrastructure/` once a second caller needs it | [service-catalog.md](service-catalog.md) |
+| Browser behaviour | A small script in `static/`, loaded only on its page | [contracts.md](contracts.md#template-and-script-contract) |
+| A third-party service or env variable | Read it in `web::run`, add it to `.env.example` | [service-catalog.md](service-catalog.md#external-services), [contracts.md](contracts.md#configuration) |
+
+When `web.rs` gets hard to navigate, split it by feature (discovery, routes, accounts, admin) as listed in the [service catalog](service-catalog.md#web-application). When the app needs a second process, such as a worker for email or image processing, the service catalog entry for that module is its starting interface.
+
 ## Stack decision
 
 | Option | Rust learning and upkeep | SSR/SEO | Maps | Deployment | Decision |
@@ -31,7 +139,7 @@ This is deliberately a small domain model rather than a forest of traits and gen
 
 ## Data and visibility
 
-The schema has users, sessions, routes, route_images, route_reports and email_verifications. A route owns its GPX file and public geometry. Category (`cycling`) is separate from cycling type so hiking and running can be added without changing route ownership. `visibility` is one of public, unlisted and private. Public discovery queries only `public`; unlisted detail and GPX require possession of the unguessable slug; private detail and downloads require owner or administrator. Map geometry and image endpoints follow the same gate. Email verification and contributor verification are distinct fields; only an administrator sets the contributor flag. Each route also stores the bounding box of its public geometry (`min_lat`, `max_lat`, `min_lon`, `max_lon`); nearby search prefilters by that box and measures distance only to the public, endpoint-trimmed line, never the original GPX. The rider's location arrives rounded to two decimals, is never stored, and request logs record paths without query strings ([design](specs/2026-10-20-nearby-routes-design.md)).
+The schema has users, sessions, routes, route_images, route_reports and email_verifications; every column is described in the [data catalog](data-catalog.md). A route owns its GPX file and public geometry. Category (`cycling`) is separate from cycling type so hiking and running can be added without changing route ownership. `visibility` is one of public, unlisted and private. Public discovery queries only `public`; unlisted detail and GPX require possession of the unguessable slug; private detail and downloads require owner or administrator. Map geometry and image endpoints follow the same gate. Email verification and contributor verification are distinct fields; only an administrator sets the contributor flag. Each route also stores the bounding box of its public geometry (`min_lat`, `max_lat`, `min_lon`, `max_lon`); nearby search prefilters by that box and measures distance only to the public, endpoint-trimmed line, never the original GPX. The rider's location arrives rounded to two decimals, is never stored, and request logs record paths without query strings ([design](specs/2026-10-20-nearby-routes-design.md)).
 
 The uploader controls endpoint hiding before public sharing. When enabled, a published geometry copy omits a user-selected radius from each end; the original GPX stays private to the owner and the public download is a generated redacted GPX. The interface must make this distinction explicit. The initial implementation should never expose raw file paths or GPS data through predictable static URLs.
 
@@ -55,4 +163,4 @@ For a single host, back up the SQLite database with its online backup mechanism 
 
 ## Rust concepts in this implementation
 
-Handlers borrow shared state through Axum's `State<Arc<AppState>>`; the pool and template registry are shared safely without copying their internals. GPX parsing borrows the XML text while walking nodes, then creates owned route data before the document is dropped. `Result` and `?` propagate parse, database, and filesystem errors; user input errors are turned into 4xx responses at the HTTP boundary. Structs for parsed geometry and route records keep domain invariants explicit without a large repository or trait hierarchy.
+Handlers borrow shared state through Axum's `State<Arc<AppState>>`; the pool and template registry are shared safely without copying their internals. GPX parsing borrows the XML text while walking nodes, then creates owned route data before the document is dropped. `Result` and `?` propagate parse, database, and filesystem errors; user input errors are turned into 4xx responses at the HTTP boundary. Structs for parsed geometry and route records keep domain invariants explicit without a large repository or trait hierarchy. For a guided tour of these concepts with examples from the code, see [learning-rust.md](learning-rust.md).
