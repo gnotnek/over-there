@@ -31,13 +31,13 @@ This is deliberately a small domain model rather than a forest of traits and gen
 
 ## Data and visibility
 
-The schema has users, sessions, routes, route_images, route_reports and email_verifications. A route owns its GPX file and public geometry. Category (`cycling`) is separate from cycling type so hiking and running can be added without changing route ownership. `visibility` is one of public, unlisted and private. Public discovery queries only `public`; unlisted detail and GPX require possession of the unguessable slug; private detail and downloads require owner or administrator. Map geometry and image endpoints follow the same gate. Email verification and contributor verification are distinct fields; only an administrator sets the contributor flag.
+The schema has users, sessions, routes, route_images, route_reports and email_verifications. A route owns its GPX file and public geometry. Category (`cycling`) is separate from cycling type so hiking and running can be added without changing route ownership. `visibility` is one of public, unlisted and private. Public discovery queries only `public`; unlisted detail and GPX require possession of the unguessable slug; private detail and downloads require owner or administrator. Map geometry and image endpoints follow the same gate. Email verification and contributor verification are distinct fields; only an administrator sets the contributor flag. Each route also stores the bounding box of its public geometry (`min_lat`, `max_lat`, `min_lon`, `max_lon`); nearby search prefilters by that box and measures distance only to the public, endpoint-trimmed line, never the original GPX. The rider's location arrives rounded to two decimals, is never stored, and request logs record paths without query strings ([design](specs/2026-10-20-nearby-routes-design.md)).
 
 The uploader controls endpoint hiding before public sharing. When enabled, a published geometry copy omits a user-selected radius from each end; the original GPX stays private to the owner and the public download is a generated redacted GPX. The interface must make this distinction explicit. The initial implementation should never expose raw file paths or GPS data through predictable static URLs.
 
 ## Primary flows and page structure
 
-1. Visitor: home → explore with title/region/type/difficulty/distance/sort → route detail/map/profile → GPX download.
+1. Visitor: home → explore (a map, plus the nearest public routes when the rider shares a location) with title/region/type/difficulty/distance/sort → route detail/map/profile → GPX download.
 2. Contributor: register → verify email → upload GPX → review computed metrics and privacy → publish → dashboard/edit.
 3. Moderator: admin report queue → inspect route → remove content or dismiss → manage contributor badge.
 

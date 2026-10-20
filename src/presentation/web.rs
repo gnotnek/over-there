@@ -1,6 +1,6 @@
 use crate::{
     domain::{
-        gpx,
+        gpx, nearby,
         route::{self, RouteDraft, Visibility},
     },
     identity::{
@@ -190,6 +190,16 @@ fn route_json(r: &RouteRecord) -> Value {
         "endpoint_hidden":r.hide_endpoints_m>0.0,
     })
 }
+/// Map pins for listed routes, at the first point of their public geometry.
+fn pins_json<'a>(routes: impl Iterator<Item = &'a RouteRecord>) -> String {
+    let pins: Vec<Value> = routes
+        .filter_map(|r| {
+            let [lon, lat] = nearby::first_point(&r.geometry_json)?;
+            Some(json!({"slug":r.slug,"title":r.title,"lon":lon,"lat":lat}))
+        })
+        .collect();
+    json!(pins).to_string()
+}
 fn format_duration(s: i64) -> String {
     format!("{}h {}m", s / 3600, (s % 3600) / 60)
 }
@@ -288,6 +298,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .connect_with(opts)
         .await?;
     sqlx::migrate!().run(&pool).await?;
+    let updated = routes::backfill_route_boxes(&pool).await?;
+    if updated > 0 {
+        tracing::info!(updated, "route boxes backfilled");
+    }
     let mut templates = Handlebars::new();
     handlebars::handlebars_helper!(eq: |a: str, b: str| a == b);
     templates.register_helper("eq", Box::new(eq));
@@ -356,7 +370,10 @@ fn router(state: Shared) -> Router {
         .route("/admin/reports/{id}", post(admin_report))
         .nest_service("/static", ServeDir::new("static"))
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
-        .layer(TraceLayer::new_for_http())
+        // Log the path only: query strings can carry a rider's rounded location.
+        .layer(TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<Body>| {
+            tracing::info_span!("request", method = %req.method(), path = %req.uri().path())
+        }))
         .with_state(state)
 }
 
@@ -384,6 +401,7 @@ struct ExploreQuery {
     max_km: Option<f64>,
     sort: Option<String>,
     page: Option<i64>,
+    near: Option<String>,
 }
 async fn explore(
     State(state): State<Shared>,
@@ -398,7 +416,35 @@ async fn explore(
     let min_km = q.min_km.unwrap_or(0.0).max(0.0);
     let max_km = q.max_km.unwrap_or(100_000.0).max(min_km);
     let page = q.page.unwrap_or(1).clamp(1, 10_000);
-    let sort = q.sort.unwrap_or_else(|| "newest".into());
+    let sort = q.sort.unwrap_or_default();
+    let near = q.near.as_deref().and_then(nearby::parse_near);
+    let nearby_mode = near.is_some() && (sort.is_empty() || sort == "nearest");
+    let mut data = base_context(&state, &v, "Explore routes", "explore");
+    data["filters"] = json!({"q":query,"region":region,"cycling_type":cycling_type,"difficulty":difficulty,"min_km":if min_km>0.0 {Some(min_km)}else{None},"max_km":if max_km<100_000.0{Some(max_km)}else{None},"popular":sort=="popular","nearest":nearby_mode});
+    data["nearby"] = json!(nearby_mode);
+    if let Some(near) = near {
+        data["near"] = json!(format!("{},{}", near.lat, near.lon));
+    }
+    if let (true, Some(near)) = (nearby_mode, near) {
+        let b = nearby::search_box(near, nearby::RADIUS_M);
+        let candidates: Vec<RouteRecord> = sqlx::query_as("SELECT * FROM routes WHERE visibility='public' AND (?='' OR title LIKE '%'||?||'%') AND (?='' OR region LIKE '%'||?||'%') AND (?='' OR cycling_type=?) AND (?='' OR difficulty=?) AND distance_m>=? AND distance_m<=? AND min_lat<=? AND max_lat>=? AND min_lon<=? AND max_lon>=?")
+            .bind(&query).bind(&query).bind(&region).bind(&region).bind(&cycling_type).bind(&cycling_type).bind(&difficulty).bind(&difficulty).bind(min_km*1000.0).bind(max_km*1000.0)
+            .bind(b.max_lat).bind(b.min_lat).bind(b.max_lon).bind(b.min_lon)
+            .fetch_all(&state.pool).await.map_err(AppError::internal)?;
+        let ranked = nearby::rank(candidates, |r| r.geometry_json.as_str(), near);
+        data["routes"] = json!(ranked
+            .iter()
+            .map(|(r, d)| {
+                let mut route = route_json(r);
+                route["away_km"] = json!(format!("{:.1}", d / 1000.0));
+                route
+            })
+            .collect::<Vec<_>>());
+        data["pins_json"] = json!(pins_json(ranked.iter().map(|(r, _)| r)));
+        data["count"] = json!(ranked.len());
+        data["page_number"] = json!(1);
+        return render(&state, v, data);
+    }
     let sql = if sort == "popular" {
         "SELECT * FROM routes WHERE visibility='public' AND (?='' OR title LIKE '%'||?||'%') AND (?='' OR region LIKE '%'||?||'%') AND (?='' OR cycling_type=?) AND (?='' OR difficulty=?) AND distance_m>=? AND distance_m<=? ORDER BY download_count DESC, created_at DESC LIMIT 12 OFFSET ?"
     } else {
@@ -422,9 +468,8 @@ async fn explore(
     let count:i64=sqlx::query_scalar("SELECT count(*) FROM routes WHERE visibility='public' AND (?='' OR title LIKE '%'||?||'%') AND (?='' OR region LIKE '%'||?||'%') AND (?='' OR cycling_type=?) AND (?='' OR difficulty=?) AND distance_m>=? AND distance_m<=?")
         .bind(&query).bind(&query).bind(&region).bind(&region).bind(&cycling_type).bind(&cycling_type).bind(&difficulty).bind(&difficulty).bind(min_km*1000.0).bind(max_km*1000.0)
         .fetch_one(&state.pool).await.map_err(AppError::internal)?;
-    let mut data = base_context(&state, &v, "Explore routes", "explore");
     data["routes"] = json!(routes.iter().map(route_json).collect::<Vec<_>>());
-    data["filters"] = json!({"q":query,"region":region,"cycling_type":cycling_type,"difficulty":difficulty,"min_km":if min_km>0.0 {Some(min_km)}else{None},"max_km":if max_km<100_000.0{Some(max_km)}else{None},"popular":sort=="popular"});
+    data["pins_json"] = json!(pins_json(routes.iter()));
     data["count"] = json!(count);
     data["page_number"] = json!(page);
     data["has_prev"] = json!(page > 1);
@@ -904,6 +949,7 @@ async fn upload(
     };
     let public_segments = gpx::public_segments(&parsed.segments, hide).map_err(AppError::bad)?;
     let geometry = gpx::geojson(&public_segments);
+    let route_box = nearby::bbox(&geometry);
     let id = Uuid::new_v4().to_string();
     let slug = route::slugify(&draft.title, &id);
     let gpx_key = write_asset(&state, &raw, "gpx").await?;
@@ -927,12 +973,13 @@ async fn upload(
         .as_ref()
         .map(|e| serde_json::to_string(e).unwrap());
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
-    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key) VALUES (?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon) VALUES (?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&id).bind(&user.id).bind(&slug).bind(&draft.title).bind(&draft.description)
         .bind(&draft.cycling_type).bind(&draft.region).bind(&draft.country)
         .bind(&draft.difficulty).bind(&draft.tags).bind(draft.visibility_str())
         .bind(&gpx_key).bind(&public_gpx_key).bind(&sha).bind(hide).bind(&geometry).bind(&elevation)
         .bind(parsed.distance_m).bind(parsed.gain_m).bind(parsed.loss_m).bind(parsed.duration_s).bind(&cover_key)
+        .bind(route_box.map(|b| b.min_lat)).bind(route_box.map(|b| b.max_lat)).bind(route_box.map(|b| b.min_lon)).bind(route_box.map(|b| b.max_lon))
         .execute(&mut *tx).await;
     if let Err(e) = result {
         let _ = tokio::fs::remove_file(state.storage.join(gpx_key)).await;
@@ -1265,6 +1312,7 @@ async fn admin_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::nearby;
     use axum::{body::to_bytes, http::Request};
     use tower::ServiceExt;
 
@@ -1328,18 +1376,20 @@ mod tests {
             .unwrap()
             .to_owned()
     }
-    #[tokio::test]
-    async fn public_pages_render_and_route_privacy_is_enforced() {
-        let (app, state, _dir) = setup().await;
-        let home = send(&app, "GET", "/", Body::empty(), None, None).await;
-        assert_eq!(home.status(), StatusCode::OK);
-        let body = to_bytes(home.into_body(), usize::MAX).await.unwrap();
-        assert!(String::from_utf8_lossy(&body).contains("Go a little further"));
-        if let Ok(path) = std::env::var("PREVIEW_OUT") {
-            let html = String::from_utf8_lossy(&body).replace("/static/", "static/");
-            std::fs::write(path, html).unwrap();
-        }
-        let register = send(&app, "GET", "/register", Body::empty(), None, None).await;
+    const TAIPEI_GPX: &str = "<gpx><trk><trkseg><trkpt lat=\"25\" lon=\"121\"><ele>5</ele></trkpt><trkpt lat=\"25.01\" lon=\"121.01\"><ele>25</ele></trkpt><trkpt lat=\"25.02\" lon=\"121.02\"><ele>40</ele></trkpt><trkpt lat=\"25.03\" lon=\"121.03\"><ele>20</ele></trkpt></trkseg></trk></gpx>";
+
+    async fn body_text(response: Response) -> String {
+        String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+                .to_vec(),
+        )
+        .unwrap()
+    }
+
+    async fn signed_in_rider(app: &Router, state: &Shared) -> String {
+        let register = send(app, "GET", "/register", Body::empty(), None, None).await;
         assert_eq!(register.status(), StatusCode::OK);
         let cookie = register.headers()[header::SET_COOKIE]
             .to_str()
@@ -1348,17 +1398,10 @@ mod tests {
             .next()
             .unwrap()
             .to_owned();
-        let html = String::from_utf8(
-            to_bytes(register.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        let csrf = field(&html, "csrf");
-        let form=format!("csrf={csrf}&username=test_rider&email=test%40example.com&password=a+very+long+test+password");
+        let csrf = field(&body_text(register).await, "csrf");
+        let form = format!("csrf={csrf}&username=test_rider&email=test%40example.com&password=a+very+long+test+password");
         let registered = send(
-            &app,
+            app,
             "POST",
             "/register",
             Body::from(form),
@@ -1380,44 +1423,68 @@ mod tests {
         .execute(&state.pool)
         .await
         .unwrap();
-        let upload_page = send(&app, "GET", "/upload", Body::empty(), None, Some(&session)).await;
+        session
+    }
+
+    async fn upload_route(
+        app: &Router,
+        session: &str,
+        title: &str,
+        gpx: &str,
+        visibility: &str,
+        difficulty: &str,
+    ) -> String {
+        let upload_page = send(app, "GET", "/upload", Body::empty(), None, Some(session)).await;
         assert_eq!(upload_page.status(), StatusCode::OK);
-        let html = String::from_utf8(
-            to_bytes(upload_page.into_body(), usize::MAX)
-                .await
-                .unwrap()
-                .to_vec(),
-        )
-        .unwrap();
-        let csrf = field(&html, "csrf");
-        let gpx="<gpx><trk><trkseg><trkpt lat=\"25\" lon=\"121\"><ele>5</ele></trkpt><trkpt lat=\"25.01\" lon=\"121.01\"><ele>25</ele></trkpt><trkpt lat=\"25.02\" lon=\"121.02\"><ele>40</ele></trkpt><trkpt lat=\"25.03\" lon=\"121.03\"><ele>20</ele></trkpt></trkseg></trk></gpx>";
+        let csrf = field(&body_text(upload_page).await, "csrf");
         let mut multipart = String::new();
         for (k, value) in [
             ("csrf", csrf.as_str()),
-            ("title", "Taipei Test Ride"),
+            ("title", title),
             ("description", "A synthetic route"),
             ("cycling_type", "road"),
             ("region", "Taipei"),
             ("country", "Taiwan"),
-            ("difficulty", "easy"),
+            ("difficulty", difficulty),
             ("tags", "river"),
-            ("visibility", "private"),
+            ("visibility", visibility),
             ("hide_endpoints", "250"),
         ] {
             multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{value}\r\n"));
         }
         multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"gpx\"; filename=\"ride.gpx\"\r\nContent-Type: application/gpx+xml\r\n\r\n{gpx}\r\n--test-boundary--\r\n"));
         let uploaded = send(
-            &app,
+            app,
             "POST",
             "/upload",
             Body::from(multipart),
             Some("multipart/form-data; boundary=test-boundary"),
-            Some(&session),
+            Some(session),
         )
         .await;
         assert_eq!(uploaded.status(), StatusCode::SEE_OTHER);
-        let location = uploaded.headers()[header::LOCATION].to_str().unwrap();
+        uploaded.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn public_pages_render_and_route_privacy_is_enforced() {
+        let (app, state, _dir) = setup().await;
+        let home = send(&app, "GET", "/", Body::empty(), None, None).await;
+        assert_eq!(home.status(), StatusCode::OK);
+        let body = to_bytes(home.into_body(), usize::MAX).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("Go a little further"));
+        if let Ok(path) = std::env::var("PREVIEW_OUT") {
+            let html = String::from_utf8_lossy(&body).replace("/static/", "static/");
+            std::fs::write(path, html).unwrap();
+        }
+        let session = signed_in_rider(&app, &state).await;
+        let gpx = TAIPEI_GPX;
+        let location =
+            upload_route(&app, &session, "Taipei Test Ride", gpx, "private", "easy").await;
+        let location = location.as_str();
         let private = send(&app, "GET", location, Body::empty(), None, None).await;
         assert_eq!(private.status(), StatusCode::NOT_FOUND);
         let owner = send(&app, "GET", location, Body::empty(), None, Some(&session)).await;
@@ -1531,5 +1598,163 @@ mod tests {
     fn focus_ring_wins_over_component_shadows() {
         // .button, .route-card and the account pill set box-shadow at equal or higher specificity.
         assert!(STYLE.contains(":focus-visible{outline:none;box-shadow:var(--ring)!important}"));
+    }
+
+    async fn stored_box(state: &Shared) -> (Option<nearby::BBox>, Option<nearby::BBox>) {
+        let (geometry, min_lat, max_lat, min_lon, max_lon): (
+            String,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+            Option<f64>,
+        ) = sqlx::query_as("SELECT geometry_json,min_lat,max_lat,min_lon,max_lon FROM routes")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap();
+        let stored = min_lat.map(|min_lat| nearby::BBox {
+            min_lat,
+            max_lat: max_lat.unwrap(),
+            min_lon: min_lon.unwrap(),
+            max_lon: max_lon.unwrap(),
+        });
+        (stored, nearby::bbox(&geometry))
+    }
+
+    #[tokio::test]
+    async fn upload_stores_public_geometry_route_box() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        upload_route(&app, &session, "Box Ride", TAIPEI_GPX, "public", "easy").await;
+        let (stored, expected) = stored_box(&state).await;
+        assert!(expected.is_some());
+        assert_eq!(stored, expected);
+    }
+
+    #[tokio::test]
+    async fn backfill_fills_missing_route_boxes() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        upload_route(&app, &session, "Box Ride", TAIPEI_GPX, "public", "easy").await;
+        sqlx::query("UPDATE routes SET min_lat=NULL,max_lat=NULL,min_lon=NULL,max_lon=NULL")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        assert_eq!(routes::backfill_route_boxes(&state.pool).await.unwrap(), 1);
+        let (stored, expected) = stored_box(&state).await;
+        assert_eq!(stored, expected);
+        assert_eq!(routes::backfill_route_boxes(&state.pool).await.unwrap(), 0);
+    }
+
+    /// A synthetic ~1 km line heading north from (lat, lon).
+    fn line_gpx(lat: f64, lon: f64) -> String {
+        let points: String = (0..4)
+            .map(|i| {
+                format!(
+                    "<trkpt lat=\"{:.4}\" lon=\"{lon:.4}\"><ele>5</ele></trkpt>",
+                    lat + i as f64 * 0.003
+                )
+            })
+            .collect();
+        format!("<gpx><trk><trkseg>{points}</trkseg></trk></gpx>")
+    }
+
+    async fn nearby_fixture() -> (Router, tempfile::TempDir) {
+        let (app, state, dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        upload_route(
+            &app,
+            &session,
+            "Alpha Near",
+            &line_gpx(10.009, 20.0),
+            "public",
+            "easy",
+        )
+        .await;
+        upload_route(
+            &app,
+            &session,
+            "Bravo Middle",
+            &line_gpx(10.09, 20.0),
+            "public",
+            "hard",
+        )
+        .await;
+        upload_route(
+            &app,
+            &session,
+            "Charlie Far",
+            &line_gpx(11.8, 20.0),
+            "public",
+            "easy",
+        )
+        .await;
+        upload_route(
+            &app,
+            &session,
+            "Delta Unlisted",
+            &line_gpx(10.009, 20.001),
+            "unlisted",
+            "easy",
+        )
+        .await;
+        (app, dir)
+    }
+
+    async fn explore_body(app: &Router, query: &str) -> String {
+        let response = send(
+            app,
+            "GET",
+            &format!("/explore?{query}"),
+            Body::empty(),
+            None,
+            None,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        body_text(response).await
+    }
+
+    #[tokio::test]
+    async fn explore_near_lists_public_routes_within_radius_nearest_first() {
+        let (app, _dir) = nearby_fixture().await;
+        let body = explore_body(&app, "near=10.00,20.00").await;
+        let (alpha, bravo) = (
+            body.find("Alpha Near").unwrap(),
+            body.find("Bravo Middle").unwrap(),
+        );
+        assert!(alpha < bravo);
+        assert!(!body.contains("Charlie Far"));
+        assert!(!body.contains("Delta Unlisted"));
+        assert!(body.contains("km away"));
+    }
+
+    #[tokio::test]
+    async fn explore_near_keeps_filters() {
+        let (app, _dir) = nearby_fixture().await;
+        let body = explore_body(&app, "near=10.00,20.00&difficulty=hard").await;
+        assert!(body.contains("Bravo Middle"));
+        assert!(!body.contains("Alpha Near"));
+    }
+
+    #[tokio::test]
+    async fn explore_ignores_invalid_near() {
+        let (app, _dir) = nearby_fixture().await;
+        let body = explore_body(&app, "near=999,0").await;
+        for title in ["Alpha Near", "Bravo Middle", "Charlie Far"] {
+            assert!(body.contains(title), "{title}");
+        }
+        assert!(!body.contains("km away"));
+    }
+
+    #[tokio::test]
+    async fn explore_other_sort_ignores_near() {
+        let (app, _dir) = nearby_fixture().await;
+        let body = explore_body(&app, "near=10.00,20.00&sort=newest").await;
+        for title in ["Alpha Near", "Bravo Middle", "Charlie Far"] {
+            assert!(body.contains(title), "{title}");
+        }
+        assert!(!body.contains("km away"));
+        assert!(body.contains("name=\"near\" value=\"10,20\""));
+        assert!(body.contains("<option value=\"newest\" selected>"));
     }
 }

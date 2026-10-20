@@ -85,15 +85,17 @@ h1,h2,h3{font-family:var(--display);font-weight:700}
 .page-heading p{color:var(--muted);margin:0;font-size:18px}
 .page-heading>a:not(.button){font-weight:600;padding:10px 18px;border-radius:var(--pill);background:var(--bg)}
 .result-count{font-size:14px;color:var(--muted);white-space:nowrap}
-.explore-sheet .page-heading{min-height:240px;padding:35px 42px;border-radius:var(--r-card);overflow:hidden;align-items:end;background:var(--black) url('/static/images/ride-beyond.webp') center 43%/cover;position:relative;color:var(--white)}
-.explore-sheet .page-heading::before{content:'';position:absolute;inset:0;background:var(--overlay)}
-.explore-sheet .page-heading>*{position:relative}
-.explore-sheet .result-count{color:var(--white)}
 .filter-form{display:grid;grid-template-columns:1.2fr 1fr 1fr 1fr 95px 95px 1fr auto;gap:12px;align-items:end;padding:22px;background:var(--bg);border-radius:var(--r-card);margin-bottom:32px}
 .filter-form label,.route-form label,.auth-form label,.settings-layout label,.report-panel label{display:flex;flex-direction:column;gap:7px;font-size:13px;font-weight:700}
 .filter-form input,.filter-form select,.route-form input,.route-form select,.route-form textarea,.auth-form input,.settings-layout input,.settings-layout textarea,.report-panel select,.report-panel textarea{width:100%;height:var(--control-h);border:1px solid var(--line);background:var(--white);color:var(--black);padding:0 14px;border-radius:var(--r-control);font-size:14px;font-weight:400}
 .route-form textarea,.settings-layout textarea,.report-panel textarea{height:auto;min-height:var(--control-h);padding:12px 14px;resize:vertical}
 .explore-sheet .route-grid,.app-sheet .route-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
+.explore-split{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:20px;align-items:start}
+.explore-map-card{position:sticky;top:12px;height:min(70vh,640px);border-radius:var(--r-sheet);overflow:hidden;background:var(--bg);box-shadow:var(--shadow-sm)}
+.explore-map{width:100%;height:100%}
+.near-me{position:absolute;top:14px;left:14px;z-index:2}
+.explore-results .route-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
+.route-card.is-active{box-shadow:var(--ring)}
 .pagination{display:flex;justify-content:center;gap:26px;align-items:center;padding:34px}
 .pagination a,.pagination span{white-space:nowrap}
 .pagination a{font-weight:600;padding:10px 18px;border-radius:var(--pill);background:var(--bg)}
@@ -141,7 +143,9 @@ h1,h2,h3{font-family:var(--display);font-weight:700}
 .route-side strong{font-family:var(--display);font-size:24px;letter-spacing:-.03em}
 .route-side span{color:var(--muted);font-size:13px}
 .route-side .button{width:100%;margin-top:20px}
-.map-point{width:18px;height:18px;border-radius:50%;background:var(--lime);border:4px solid var(--black);box-shadow:var(--shadow-sm)}
+.map-point{width:18px;height:18px;padding:0;border-radius:50%;background:var(--lime);border:4px solid var(--black);box-shadow:var(--shadow-sm);cursor:pointer}
+.map-point.is-active{box-shadow:var(--ring)}
+.map-you{width:16px;height:16px;border-radius:50%;background:var(--black);border:2px solid var(--white);box-shadow:0 0 0 4px var(--lime),var(--shadow-sm)}
 .map-finish{background:var(--black);border-color:var(--lime)}
 .map-hover{width:15px;height:15px;background:var(--white);border-color:var(--black)}
 .notice{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);z-index:30;background:var(--black);color:var(--white);padding:13px 20px;border-radius:var(--pill);box-shadow:var(--shadow-lg);font-size:14px;max-width:calc(100% - 30px)}
@@ -217,6 +221,7 @@ input[type=file]::file-selector-button{margin-right:12px;border:0;border-radius:
 .filter-form{grid-template-columns:repeat(4,1fr)}
 .route-grid,.explore-sheet .route-grid,.app-sheet .route-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
 .route-layout{grid-template-columns:1fr}
+.explore-results .route-grid{grid-template-columns:1fr}
 .route-side{position:static;display:none}
 .route-intro{align-items:start}
 .hero{grid-template-columns:1fr 43%;gap:20px}
@@ -248,8 +253,13 @@ input[type=file]::file-selector-button{margin-right:12px;border:0;border-radius:
 .app-frame{padding:0}
 .app-sheet{border-radius:0;border:0;padding:24px 16px}
 .page-heading{align-items:start;flex-direction:column}
-.explore-sheet .page-heading{min-height:180px;margin:0 0 24px;padding:28px 18px}
 .filter-form{grid-template-columns:1fr 1fr;gap:13px;padding:16px}
+/* Phones: heading, map, filters, then results. */
+.explore-sheet{display:flex;flex-direction:column}
+.explore-split{display:contents}
+.explore-map-card{order:1;position:relative;top:auto;height:360px;margin-bottom:20px}
+.explore-sheet .filter-form{order:2}
+.explore-results{order:3}
 .filter-form label:nth-child(-n+4),.filter-form label:nth-child(7),.filter-form .button{grid-column:span 2}
 .route-layout{padding:0;gap:0}
 .route-map{height:420px;margin:0;border-radius:0}

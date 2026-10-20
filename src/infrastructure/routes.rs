@@ -1,3 +1,4 @@
+use crate::domain::nearby;
 use sqlx::{FromRow, SqlitePool};
 
 #[derive(Clone, Debug, FromRow)]
@@ -36,4 +37,29 @@ pub async fn find_by_slug(
         .bind(slug)
         .fetch_optional(pool)
         .await
+}
+
+/// Fills the public-geometry box for routes stored before boxes existed. Idempotent.
+pub async fn backfill_route_boxes(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
+    let missing: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, geometry_json FROM routes WHERE min_lat IS NULL")
+            .fetch_all(pool)
+            .await?;
+    let mut updated = 0;
+    for (id, geometry) in missing {
+        let Some(b) = nearby::bbox(&geometry) else {
+            continue;
+        };
+        updated +=
+            sqlx::query("UPDATE routes SET min_lat=?,max_lat=?,min_lon=?,max_lon=? WHERE id=?")
+                .bind(b.min_lat)
+                .bind(b.max_lat)
+                .bind(b.min_lon)
+                .bind(b.max_lon)
+                .bind(id)
+                .execute(pool)
+                .await?
+                .rows_affected();
+    }
+    Ok(updated)
 }

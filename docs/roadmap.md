@@ -14,7 +14,7 @@ Make the existing pages look consistent and modern without changing what they do
 
 Decided: rebrand to the black, electric lime and white palette with Manjari and Inter, pill buttons and large rounded cards, inspired by the Pilo case study. One radius scale and one control height so rows line up. CSS, the font link and the route page colors only; no new JavaScript or dependencies.
 
-## Phase 2: Routes near me (next)
+## Phase 2: Routes near me (done)
 
 Opening Explore shows a map and the public routes closest to the rider. Design: [specs/2026-10-20-nearby-routes-design.md](specs/2026-10-20-nearby-routes-design.md).
 
