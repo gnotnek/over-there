@@ -49,6 +49,7 @@ struct AppState {
     storage: PathBuf,
     base_url: String,
     map_style: String,
+    routing_url: String,
     secure_cookie: bool,
     brevo_api_key: Option<String>,
     mail_from: Option<String>,
@@ -329,6 +330,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .trim_end_matches('/')
         .to_owned();
     let map_style = env::var("MAP_STYLE_URL").unwrap_or_else(|_| "/static/map-style.json".into());
+    let routing_url =
+        env::var("ROUTING_URL").unwrap_or_else(|_| "https://brouter.de/brouter".into());
     let brevo_api_key = env::var("BREVO_API_KEY").ok();
     let mail_from = env::var("MAIL_FROM").ok();
     if env::var("APP_ENV").as_deref() == Ok("production") {
@@ -349,6 +352,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         storage = %storage.display(),
         email = if brevo_api_key.is_some() { "brevo" } else { "log" },
         custom_map_style = map_style != "/static/map-style.json",
+        %routing_url,
         "configuration loaded"
     );
     let state = Arc::new(AppState {
@@ -358,6 +362,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         secure_cookie: base_url.starts_with("https://"),
         base_url,
         map_style,
+        routing_url,
         brevo_api_key,
         mail_from,
     });
@@ -483,6 +488,7 @@ fn router(state: Shared) -> Router {
         .route("/logout", post(logout))
         .route("/verify/{token}", get(verify_email))
         .route("/upload", get(upload_form).post(upload))
+        .route("/routes/new", get(draw_form))
         .route("/routes/{slug}", get(route_detail))
         .route("/routes/{slug}/geometry", get(route_geometry))
         .route("/routes/{slug}/download", get(download))
@@ -1016,6 +1022,14 @@ async fn upload_form(State(state): State<Shared>, headers: HeaderMap) -> WebResu
     let data = base_context(&state, &v, "Share a route", "upload");
     render(&state, v, data)
 }
+async fn draw_form(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    require_user(&v)?;
+    let mut data = base_context(&state, &v, "Draw a route", "upload");
+    data["draw"] = json!(true);
+    data["routing_url"] = json!(state.routing_url);
+    render(&state, v, data)
+}
 async fn multipart_values(
     mut multipart: Multipart,
 ) -> Result<(HashMap<String, String>, HashMap<String, Vec<u8>>), AppError> {
@@ -1085,9 +1099,19 @@ async fn upload(
     let (form, mut files) = multipart_values(multipart).await?;
     csrf(&headers, &form, &v, &state)?;
     let draft = RouteDraft::from_fields(&form).map_err(AppError::bad)?;
-    let raw = files
-        .remove("gpx")
-        .ok_or_else(|| AppError::bad("Choose a GPX file"))?;
+    let (raw, plan) = match (files.remove("line"), files.remove("plan")) {
+        (Some(line), Some(plan)) => {
+            let (raw, plan) = gpx::drawn_route(&line, &plan).map_err(AppError::bad)?;
+            (raw, Some(plan))
+        }
+        (None, None) => (
+            files
+                .remove("gpx")
+                .ok_or_else(|| AppError::bad("Choose a GPX file"))?,
+            None,
+        ),
+        _ => return Err(AppError::bad("Draw at least two points")),
+    };
     let parsed = gpx::parse(&raw).map_err(AppError::bad)?;
     let sha = format!("{:x}", Sha256::digest(&raw));
     let duplicate: Option<String> =
@@ -1132,13 +1156,13 @@ async fn upload(
         .as_ref()
         .map(|e| serde_json::to_string(e).unwrap());
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
-    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon) VALUES (?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon,plan_json) VALUES (?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
         .bind(&id).bind(&user.id).bind(&slug).bind(&draft.title).bind(&draft.description)
         .bind(&draft.cycling_type).bind(&draft.region).bind(&draft.country)
         .bind(&draft.difficulty).bind(&draft.tags).bind(draft.visibility_str())
         .bind(&gpx_key).bind(&public_gpx_key).bind(&sha).bind(hide).bind(&geometry).bind(&elevation)
         .bind(parsed.distance_m).bind(parsed.gain_m).bind(parsed.loss_m).bind(parsed.duration_s).bind(&cover_key)
-        .bind(route_box.map(|b| b.min_lat)).bind(route_box.map(|b| b.max_lat)).bind(route_box.map(|b| b.min_lon)).bind(route_box.map(|b| b.max_lon))
+        .bind(route_box.map(|b| b.min_lat)).bind(route_box.map(|b| b.max_lat)).bind(route_box.map(|b| b.min_lon)).bind(route_box.map(|b| b.max_lon)).bind(&plan)
         .execute(&mut *tx).await;
     if let Err(e) = result {
         let written = [Some(gpx_key), public_gpx_key, cover_key]
@@ -1167,6 +1191,7 @@ async fn upload(
         distance_m = parsed.distance_m.round(),
         hide_endpoints_m = hide,
         photos = photo_keys.len(),
+        drawn = plan.is_some(),
         "route uploaded"
     );
     Ok(redirect(&format!("/routes/{slug}")))
@@ -1564,6 +1589,7 @@ mod tests {
             storage,
             base_url: "http://localhost".into(),
             map_style: "/static/map-style.json".into(),
+            routing_url: "https://brouter.de/brouter".into(),
             secure_cookie: false,
             brevo_api_key: None,
             mail_from: None,
@@ -1986,6 +2012,164 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    const DRAWN_LINE: &str = "[[121,25,5],[121,25.01,9],[121,25.02,30]]";
+    const DRAWN_PLAN: &str = r#"{"points":[[121,25],[121,25.02]],"at":[0,2],"straight":[false]}"#;
+
+    /// Posts a drawn route; `files` are (field name, JSON) parts sent as files.
+    async fn post_drawn(
+        app: &Router,
+        session: &str,
+        title: &str,
+        files: &[(&str, &str)],
+        hide: &str,
+    ) -> Response {
+        let page = send(
+            app,
+            "GET",
+            "/routes/new",
+            Body::empty(),
+            None,
+            Some(session),
+        )
+        .await;
+        assert_eq!(page.status(), StatusCode::OK);
+        let csrf = field(&body_text(page).await, "csrf");
+        let mut multipart = String::new();
+        for (k, value) in [
+            ("csrf", csrf.as_str()),
+            ("title", title),
+            ("description", ""),
+            ("cycling_type", "road"),
+            ("region", "Taipei"),
+            ("country", "Taiwan"),
+            ("difficulty", "easy"),
+            ("tags", ""),
+            ("visibility", "public"),
+            ("hide_endpoints", hide),
+        ] {
+            multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{value}\r\n"));
+        }
+        for (k, json) in files {
+            multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{k}\"; filename=\"{k}.json\"\r\nContent-Type: application/json\r\n\r\n{json}\r\n"));
+        }
+        multipart.push_str("--test-boundary--\r\n");
+        send(
+            app,
+            "POST",
+            "/upload",
+            Body::from(multipart),
+            Some("multipart/form-data; boundary=test-boundary"),
+            Some(session),
+        )
+        .await
+    }
+    async fn draw_route(app: &Router, session: &str, title: &str, hide: &str) -> String {
+        let response = post_drawn(
+            app,
+            session,
+            title,
+            &[("line", DRAWN_LINE), ("plan", DRAWN_PLAN)],
+            hide,
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned()
+    }
+
+    #[tokio::test]
+    async fn drawn_route_is_published_and_renders() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let page = send(
+            &app,
+            "GET",
+            "/routes/new",
+            Body::empty(),
+            None,
+            Some(&session),
+        )
+        .await;
+        assert!(body_text(page).await.contains("id=\"draw-map\""));
+        let location = draw_route(&app, &session, "Drawn River Loop", "0").await;
+        let detail = body_text(send(&app, "GET", &location, Body::empty(), None, None).await).await;
+        assert!(detail.contains("Drawn River Loop"));
+        assert!(detail.contains("<strong>2.2</strong>"));
+        assert!(detail.contains("elevation-chart"));
+        assert_eq!(
+            count(
+                &state,
+                "SELECT count(*) FROM routes WHERE plan_json IS NOT NULL"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn drawn_route_needs_line_and_plan() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let line_only =
+            post_drawn(&app, &session, "Half Drawn", &[("line", DRAWN_LINE)], "0").await;
+        assert_eq!(line_only.status(), StatusCode::BAD_REQUEST);
+        let nothing = post_drawn(&app, &session, "Not Drawn", &[], "0").await;
+        assert_eq!(nothing.status(), StatusCode::BAD_REQUEST);
+        draw_route(&app, &session, "Drawn Once", "0").await;
+        let again = post_drawn(
+            &app,
+            &session,
+            "Drawn Twice",
+            &[("line", DRAWN_LINE), ("plan", DRAWN_PLAN)],
+            "0",
+        )
+        .await;
+        assert_eq!(again.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn hidden_plan_stays_private() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let line = "[[121,25,5],[121,25.01,6],[121,25.02,7],[121,25.03,8],[121,25.04,9]]";
+        let plan = r#"{"points":[[121,25],[121,25.04]],"at":[0,4],"straight":[false]}"#;
+        let response = post_drawn(
+            &app,
+            &session,
+            "Hidden Start",
+            &[("line", line), ("plan", plan)],
+            "250",
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SEE_OTHER);
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let detail = body_text(send(&app, "GET", &location, Body::empty(), None, None).await).await;
+        let geometry = body_text(
+            send(
+                &app,
+                "GET",
+                &format!("{location}/geometry"),
+                Body::empty(),
+                None,
+                None,
+            )
+            .await,
+        )
+        .await;
+        for body in [detail, geometry] {
+            assert!(!body.contains("\"points\"") && !body.contains("&quot;points&quot;"));
+            assert!(!body.contains("data-plan"));
+            assert!(
+                !body.contains("25.0]") && !body.contains("25.0,") && !body.contains("121,25]")
+            );
+        }
     }
 
     #[tokio::test]
