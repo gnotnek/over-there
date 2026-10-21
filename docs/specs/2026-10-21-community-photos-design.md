@@ -1,6 +1,6 @@
 # Phase 4: Riders add photos to a route
 
-Status: designed, not built. Part of the [roadmap](../roadmap.md).
+Status: done. Part of the [roadmap](../roadmap.md).
 
 ## Why
 

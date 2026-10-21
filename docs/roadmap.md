@@ -26,7 +26,13 @@ Riders create a route by clicking points on a map; the line follows roads using 
 
 Boundaries: routing runs in the browser, never on the server; uploaded GPX lines stay fixed; at most 100 points; no address search.
 
-## Phase 4: Show routes the way Komoot does (to be designed)
+## Phase 4: Riders add photos to a route (done)
+
+Signed-in riders add scenery photos to public and unlisted routes others shared, and like them. The route page shows the owner's photos, then the 6 most-liked from other riders; a gallery page holds the rest. Whoever added a photo, or an admin, can delete it; the owner reports other riders' photos instead. The owner can turn contributions off per route. Design: [specs/2026-10-21-community-photos-design.md](specs/2026-10-21-community-photos-design.md).
+
+Boundaries: 5 photos per rider per route, 10 a day for accounts without a verified email; likes rank photos within one route only; no comments, downvotes or notifications.
+
+## Phase 5: Show routes the way Komoot does (to be designed)
 
 - Route cards show the line drawn over a real map instead of the cover photo or plain line drawing, without loading a live map per card (likely a small server-made map image).
 - Photos pinned to spots along the route, shown as markers on the route map.
