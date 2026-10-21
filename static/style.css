@@ -135,6 +135,12 @@ h1,h2,h3{font-family:var(--display);font-weight:700}
 .route-photos h2{font-size:22px}
 .photo-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .photo-grid img{width:100%;aspect-ratio:4/3;object-fit:cover;border-radius:var(--r-thumb)}
+.photo-card{margin:0;display:flex;flex-direction:column;gap:8px}
+.photo-card figcaption{display:flex;flex-direction:column;gap:4px;font-size:13px}
+.photo-caption{color:var(--black)}
+.photo-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--gray)}
+.photo-meta a{color:var(--black);font-weight:700}
+.photo-more{margin-top:16px}
 .route-attribution{padding:32px 0;border-top:1px solid var(--line)}
 .author-line{display:flex;align-items:center;gap:12px;font-weight:700}
 .author-line img{border-radius:50%;width:44px;height:44px;object-fit:cover}

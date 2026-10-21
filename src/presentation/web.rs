@@ -303,6 +303,97 @@ fn can_view(r: &RouteRecord, user: Option<&User>) -> bool {
 fn can_edit(r: &RouteRecord, user: &User) -> bool {
     route::may_edit(&r.author_id, &user.id, user.is_admin != 0)
 }
+#[derive(Clone, Copy)]
+enum PhotoFilter {
+    Owner,
+    Others,
+    All,
+}
+/// Photos with their rider, likes and what the viewer may do; others rank by likes, then newest.
+async fn photo_rows(
+    state: &AppState,
+    r: &RouteRecord,
+    viewer: Option<&User>,
+    filter: PhotoFilter,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Value>, AppError> {
+    let (only, order) = match filter {
+        PhotoFilter::Owner => ("AND i.uploader_id=?", "i.position,i.id"),
+        PhotoFilter::Others => ("AND i.uploader_id<>?", "likes DESC,i.created_at DESC,i.id"),
+        PhotoFilter::All => ("AND ?<>''", "likes DESC,i.created_at DESC,i.id"),
+    };
+    let sql = format!("SELECT i.id,u.username,i.uploader_id,i.caption,(SELECT count(*) FROM photo_likes l WHERE l.image_id=i.id) AS likes,EXISTS(SELECT 1 FROM photo_likes l WHERE l.image_id=i.id AND l.user_id=?) FROM route_images i JOIN users u ON u.id=i.uploader_id WHERE i.route_id=? {only} ORDER BY {order} LIMIT ? OFFSET ?");
+    let rows: Vec<(String, String, String, String, i64, bool)> = sqlx::query_as(&sql)
+        .bind(viewer.map(|u| u.id.as_str()).unwrap_or(""))
+        .bind(&r.id)
+        .bind(&r.author_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, username, uploader, caption, likes, liked)| {
+            let alt = if caption.is_empty() {
+                format!("Photo of {} by {username}", r.title)
+            } else {
+                caption.clone()
+            };
+            json!({
+                "id":id,"src":format!("/routes/{}/images/{id}", r.slug),"username":username,
+                "caption":caption,"alt":alt,"likes":likes,"liked":liked,
+                "can_like":viewer.is_some_and(|u| route::may_like_photo(true, &uploader, &u.id)),
+                "can_delete":viewer.is_some_and(|u| route::may_edit(&uploader, &u.id, u.is_admin != 0)),
+            })
+        })
+        .collect())
+}
+async fn photo_count(state: &AppState, r: &RouteRecord) -> Result<i64, AppError> {
+    sqlx::query_scalar("SELECT count(*) FROM route_images WHERE route_id=?")
+        .bind(&r.id)
+        .fetch_one(&state.pool)
+        .await
+        .map_err(AppError::internal)
+}
+#[derive(Deserialize)]
+struct PageQuery {
+    page: Option<i64>,
+}
+async fn route_photos(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    Query(q): Query<PageQuery>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let r = get_route(&state.pool, &slug).await?;
+    if !can_view(&r, v.user.as_ref()) {
+        return Err(AppError::not_found());
+    }
+    let page = q.page.unwrap_or(1).clamp(1, 10_000);
+    let photos = photo_rows(
+        &state,
+        &r,
+        v.user.as_ref(),
+        PhotoFilter::All,
+        24,
+        (page - 1) * 24,
+    )
+    .await?;
+    let total = photo_count(&state, &r).await?;
+    let mut data = base_context(&state, &v, &format!("Photos of {}", r.title), "photos");
+    data["route"] = route_json(&r);
+    data["photos"] = json!(photos);
+    data["photo_count"] = json!(total);
+    data["page_number"] = json!(page);
+    data["has_prev"] = json!(page > 1);
+    data["has_next"] = json!(page * 24 < total);
+    data["prev_page"] = json!(page - 1);
+    data["next_page"] = json!(page + 1);
+    render(&state, v, data)
+}
 fn may_add_photo(r: &RouteRecord, user: &User) -> bool {
     route::may_add_photo(
         Visibility::parse(&r.visibility).unwrap_or(Visibility::Private),
@@ -527,7 +618,7 @@ fn router(state: Shared) -> Router {
         .route("/routes/{slug}/line", get(line_form).post(save_line))
         .route("/routes/{slug}/delete", post(delete_route))
         .route("/routes/{slug}/report", post(report_route))
-        .route("/routes/{slug}/photos", post(add_photos))
+        .route("/routes/{slug}/photos", get(route_photos).post(add_photos))
         .route("/users/{username}", get(profile))
         .route("/users/{username}/avatar", get(avatar))
         .route("/dashboard", get(dashboard))
@@ -678,16 +769,20 @@ async fn route_detail(
     data["author"] = json!({"username":author.username,"verified":author.contributor_verified_at.is_some(),"avatar":author.avatar_key.is_some()});
     data["can_edit"] = json!(v.user.as_ref().is_some_and(|u| can_edit(&r, u)));
     data["elevation_json"] = json!(r.elevation_json);
-    let photos: Vec<String> =
-        sqlx::query_scalar("SELECT id FROM route_images WHERE route_id=? ORDER BY position,id")
-            .bind(&r.id)
-            .fetch_all(&state.pool)
-            .await
-            .map_err(AppError::internal)?;
-    data["photos"] = json!(photos
-        .iter()
-        .map(|id| format!("/routes/{}/images/{id}", r.slug))
-        .collect::<Vec<_>>());
+    let mut photos = photo_rows(
+        &state,
+        &r,
+        v.user.as_ref(),
+        PhotoFilter::Owner,
+        PHOTOS_PER_RIDER_PER_ROUTE,
+        0,
+    )
+    .await?;
+    photos.extend(photo_rows(&state, &r, v.user.as_ref(), PhotoFilter::Others, 6, 0).await?);
+    let total = photo_count(&state, &r).await?;
+    data["more_photos"] = json!(total > photos.len() as i64);
+    data["photo_count"] = json!(total);
+    data["photos"] = json!(photos);
     let can_add = v.user.as_ref().is_some_and(|u| may_add_photo(&r, u));
     let accepts = r.photos_open != 0 && r.visibility != "private";
     data["can_add_photos"] = json!(can_add);
@@ -2167,6 +2262,125 @@ mod tests {
         let bot = add_photos(&app, &rider, &location, 1, "spam.example").await;
         assert_eq!(bot.status(), StatusCode::BAD_REQUEST);
         assert_eq!(count(&state, "SELECT count(*) FROM route_images").await, 0);
+    }
+
+    /// Inserts a photo row without a file; pages render it, only image requests read the file.
+    async fn seed_photo(state: &Shared, id: &str, username: &str, position: i64, likes: usize) {
+        sqlx::query("INSERT INTO route_images(id,route_id,image_key,position,uploader_id,created_at) SELECT ?,(SELECT id FROM routes LIMIT 1),'missing.webp',?,(SELECT id FROM users WHERE username=?),datetime('now','-'||?||' seconds')")
+            .bind(id).bind(position).bind(username).bind(position)
+            .execute(&state.pool).await.unwrap();
+        for n in 0..likes {
+            sqlx::query(
+                "INSERT OR IGNORE INTO users(id,username,email,password_hash) VALUES (?,?,?,'x')",
+            )
+            .bind(format!("liker{n}"))
+            .bind(format!("liker{n}"))
+            .bind(format!("liker{n}@example.com"))
+            .execute(&state.pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO photo_likes(image_id,user_id) VALUES (?,?)")
+                .bind(id)
+                .bind(format!("liker{n}"))
+                .execute(&state.pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    fn photo_order(html: &str) -> Vec<String> {
+        html.split("id=\"photo-")
+            .skip(1)
+            .map(|rest| rest.split('"').next().unwrap().to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn route_page_shows_owner_photos_then_six_most_liked() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        signed_in_as(&app, &state, "second_rider").await;
+        seed_photo(&state, "own0", "owner_rider", 0, 0).await;
+        seed_photo(&state, "own1", "owner_rider", 1, 0).await;
+        for k in 0..8 {
+            seed_photo(&state, &format!("o{k}"), "second_rider", 2 + k as i64, k).await;
+        }
+        let html = body_text(send(&app, "GET", &location, Body::empty(), None, None).await).await;
+        assert_eq!(
+            photo_order(&html),
+            ["own0", "own1", "o7", "o6", "o5", "o4", "o3", "o2"]
+        );
+        assert!(html.contains("See all 10 photos"));
+        assert!(html.contains("/users/second_rider"));
+        assert!(html.contains("Photo of River Ride by second_rider"));
+    }
+
+    #[tokio::test]
+    async fn gallery_pages_through_all_photos() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        for k in 0..30 {
+            seed_photo(&state, &format!("p{k}"), "owner_rider", k, 0).await;
+        }
+        let first = body_text(
+            send(
+                &app,
+                "GET",
+                &format!("{location}/photos"),
+                Body::empty(),
+                None,
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(photo_order(&first).len(), 24);
+        assert!(first.contains("Next"));
+        let second = body_text(
+            send(
+                &app,
+                "GET",
+                &format!("{location}/photos?page=2"),
+                Body::empty(),
+                None,
+                None,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(photo_order(&second).len(), 6);
+        assert!(second.contains("Previous"));
+    }
+
+    #[tokio::test]
+    async fn gallery_of_private_route_is_hidden() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location =
+            upload_route(&app, &owner, "Hidden Ride", TAIPEI_GPX, "private", "easy").await;
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        let gallery = send(
+            &app,
+            "GET",
+            &format!("{location}/photos"),
+            Body::empty(),
+            None,
+            Some(&rider),
+        )
+        .await;
+        assert_eq!(gallery.status(), StatusCode::NOT_FOUND);
+        let own = send(
+            &app,
+            "GET",
+            &format!("{location}/photos"),
+            Body::empty(),
+            None,
+            Some(&owner),
+        )
+        .await;
+        assert_eq!(own.status(), StatusCode::OK);
     }
 
     #[tokio::test]
