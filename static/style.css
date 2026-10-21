@@ -89,6 +89,10 @@ h1,h2,h3{font-family:var(--display);font-weight:700}
 .filter-form{display:grid;grid-template-columns:1.2fr 1fr 1fr 1fr 95px 95px 1fr auto;gap:12px;align-items:end;padding:22px;background:var(--bg);border-radius:var(--r-card);margin-bottom:32px}
 .filter-form label,.route-form label,.auth-form label,.settings-layout label,.report-panel label{display:flex;flex-direction:column;gap:7px;font-size:13px;font-weight:700}
 .filter-form input,.filter-form select,.route-form input,.route-form select,.route-form textarea,.auth-form input,.settings-layout input,.settings-layout textarea,.report-panel select,.report-panel textarea{width:100%;height:var(--control-h);border:1px solid var(--line);background:var(--white);color:var(--black);padding:0 14px;border-radius:var(--r-control);font-size:14px;font-weight:400}
+.photo-add input{width:100%;height:var(--control-h);border:1px solid var(--line);background:var(--white);color:var(--black);padding:0 14px;border-radius:var(--r-control);font-size:14px}
+.photo-add input[type=file]{padding:10px 14px;height:auto}
+.photo-add form{display:grid;gap:12px}
+.photo-note{margin:16px 0;color:var(--gray)}
 .route-form label.check-field{flex-direction:row;align-items:center;gap:10px;font-weight:400}
 .check-field input{width:20px;height:20px;accent-color:var(--black)}
 .route-form textarea,.settings-layout textarea,.report-panel textarea{height:auto;min-height:var(--control-h);padding:12px 14px;resize:vertical}

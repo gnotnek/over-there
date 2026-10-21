@@ -152,6 +152,10 @@ fn daily_limit_reached() -> AppError {
             .into(),
     )
 }
+/// Photos one rider may add to one route, counting the owner's upload photos.
+const PHOTOS_PER_RIDER_PER_ROUTE: i64 = 5;
+/// Photos an account without a verified email may add per rolling day, across all routes.
+const UNVERIFIED_DAILY_PHOTOS: i64 = 10;
 /// Rejects forms whose hidden `website` field was filled, which people never see but bots do.
 fn honeypot(form: &HashMap<String, String>) -> Result<(), AppError> {
     if val(form, "website").is_empty() {
@@ -298,6 +302,14 @@ fn can_view(r: &RouteRecord, user: Option<&User>) -> bool {
 }
 fn can_edit(r: &RouteRecord, user: &User) -> bool {
     route::may_edit(&r.author_id, &user.id, user.is_admin != 0)
+}
+fn may_add_photo(r: &RouteRecord, user: &User) -> bool {
+    route::may_add_photo(
+        Visibility::parse(&r.visibility).unwrap_or(Visibility::Private),
+        r.photos_open != 0,
+        &r.author_id,
+        &user.id,
+    )
 }
 fn valid_choice(value: &str, choices: &[&str]) -> bool {
     choices.contains(&value)
@@ -515,6 +527,7 @@ fn router(state: Shared) -> Router {
         .route("/routes/{slug}/line", get(line_form).post(save_line))
         .route("/routes/{slug}/delete", post(delete_route))
         .route("/routes/{slug}/report", post(report_route))
+        .route("/routes/{slug}/photos", post(add_photos))
         .route("/users/{username}", get(profile))
         .route("/users/{username}/avatar", get(avatar))
         .route("/dashboard", get(dashboard))
@@ -675,6 +688,11 @@ async fn route_detail(
         .iter()
         .map(|id| format!("/routes/{}/images/{id}", r.slug))
         .collect::<Vec<_>>());
+    let can_add = v.user.as_ref().is_some_and(|u| may_add_photo(&r, u));
+    let accepts = r.photos_open != 0 && r.visibility != "private";
+    data["can_add_photos"] = json!(can_add);
+    data["sign_in_to_add"] = json!(v.user.is_none() && accepts);
+    data["photos_closed"] = json!(!can_add && r.photos_open == 0);
     data["canonical"] = json!(format!("{}/routes/{}", state.base_url, r.slug));
     render(&state, v, data)
 }
@@ -1239,6 +1257,94 @@ async fn upload(
         "route uploaded"
     );
     Ok(redirect(&format!("/routes/{slug}")))
+}
+
+async fn add_photos(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path(slug): Path<String>,
+    multipart: Multipart,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    let r = get_route(&state.pool, &slug).await?;
+    if !can_view(&r, Some(user)) {
+        return Err(AppError::not_found());
+    }
+    let (form, mut files) = multipart_values(multipart).await?;
+    csrf(&headers, &form, &v, &state)?;
+    honeypot(&form)?;
+    if !may_add_photo(&r, user) {
+        return Err(AppError::forbidden());
+    }
+    let mut photos = Vec::new();
+    for n in 1..=3 {
+        let Some(image) = files.remove(&format!("photo{n}")).filter(|f| !f.is_empty()) else {
+            continue;
+        };
+        let caption = val(&form, &format!("caption{n}")).trim();
+        if caption.chars().count() > 120 {
+            return Err(AppError::bad("Captions must be 120 characters or less"));
+        }
+        photos.push((optimized_image(&image, 1600)?, caption.to_owned()));
+    }
+    if photos.is_empty() {
+        return Err(AppError::bad("Choose at least one photo"));
+    }
+    let mut keys = Vec::new();
+    for (bytes, _) in &photos {
+        keys.push(write_asset(&state, bytes, "webp").await?);
+    }
+    let verified = user.email_verified_at.is_some();
+    let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
+    let mut refused = None;
+    for (key, (_, caption)) in keys.iter().zip(&photos) {
+        // Limits are checked by the insert itself, so parallel requests cannot pass them.
+        let saved = sqlx::query("INSERT INTO route_images(id,route_id,image_key,position,uploader_id,caption,created_at) SELECT ?,?,?,(SELECT coalesce(max(position)+1,0) FROM route_images WHERE route_id=?),?,?,datetime('now') WHERE (SELECT count(*) FROM route_images WHERE route_id=? AND uploader_id=?)<? AND (? OR (SELECT count(*) FROM route_images WHERE uploader_id=? AND created_at>datetime('now','-1 day'))<?)")
+            .bind(Uuid::new_v4().to_string()).bind(&r.id).bind(key).bind(&r.id).bind(&user.id).bind(caption)
+            .bind(&r.id).bind(&user.id).bind(PHOTOS_PER_RIDER_PER_ROUTE)
+            .bind(verified).bind(&user.id).bind(UNVERIFIED_DAILY_PHOTOS)
+            .execute(&mut *tx).await;
+        match saved {
+            Ok(done) if done.rows_affected() == 1 => {}
+            Ok(_) => {
+                let on_route: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM route_images WHERE route_id=? AND uploader_id=?",
+                )
+                .bind(&r.id)
+                .bind(&user.id)
+                .fetch_one(&mut *tx)
+                .await
+                .unwrap_or(0);
+                refused = Some(AppError(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    if on_route >= PHOTOS_PER_RIDER_PER_ROUTE {
+                        "You can add up to 5 photos to a route".into()
+                    } else {
+                        "Unverified accounts can add 10 photos a day. Verify your email to remove the limit".into()
+                    },
+                ));
+                break;
+            }
+            Err(e) => {
+                refused = Some(AppError::internal(e));
+                break;
+            }
+        }
+    }
+    let committed = match refused {
+        None => tx.commit().await.map_err(AppError::internal),
+        Some(error) => Err(error),
+    };
+    if let Err(error) = committed {
+        remove_assets(&state, keys).await;
+        return Err(error);
+    }
+    tracing::info!(route_id = %r.id, user_id = %user.id, photos = keys.len(), "photos added");
+    Ok(msg_redirect(
+        &format!("/routes/{slug}"),
+        "Thanks for adding your photos",
+    ))
 }
 
 async fn edit_form(
@@ -1904,6 +2010,163 @@ mod tests {
             Some(session),
         )
         .await
+    }
+
+    fn png() -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(8, 8)
+            .write_to(&mut out, ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    async fn add_photos(
+        app: &Router,
+        session: &str,
+        location: &str,
+        count: usize,
+        website: &str,
+    ) -> Response {
+        let page = send(app, "GET", "/upload", Body::empty(), None, Some(session)).await;
+        let csrf = field(&body_text(page).await, "csrf");
+        let mut body = Vec::new();
+        for (k, value) in [
+            ("csrf", csrf.as_str()),
+            ("website", website),
+            ("caption1", "River at dusk"),
+        ] {
+            body.extend(format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{value}\r\n").into_bytes());
+        }
+        for n in 1..=count {
+            body.extend(format!("--test-boundary\r\nContent-Disposition: form-data; name=\"photo{n}\"; filename=\"p.png\"\r\nContent-Type: image/png\r\n\r\n").into_bytes());
+            body.extend(png());
+            body.extend(b"\r\n");
+        }
+        body.extend(b"--test-boundary--\r\n");
+        send(
+            app,
+            "POST",
+            &format!("{location}/photos"),
+            Body::from(body),
+            Some("multipart/form-data; boundary=test-boundary"),
+            Some(session),
+        )
+        .await
+    }
+
+    fn stored_files(state: &Shared) -> usize {
+        std::fs::read_dir(&state.storage).unwrap().count()
+    }
+
+    #[tokio::test]
+    async fn riders_add_photos_to_someone_elses_public_route() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        let added = add_photos(&app, &rider, &location, 2, "").await;
+        assert_eq!(added.status(), StatusCode::SEE_OTHER);
+        assert_eq!(
+            count(&state, "SELECT count(*) FROM route_images i JOIN users u ON u.id=i.uploader_id WHERE u.username='second_rider' AND i.caption='River at dusk' AND i.created_at IS NOT NULL").await,
+            1
+        );
+        assert_eq!(count(&state, "SELECT count(*) FROM route_images").await, 2);
+    }
+
+    #[tokio::test]
+    async fn photos_refused_on_private_route_or_closed_switch() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let private =
+            upload_route(&app, &owner, "Private Ride", TAIPEI_GPX, "private", "easy").await;
+        let gpx = TAIPEI_GPX.replace("<ele>5</ele>", "<ele>6</ele>");
+        let closed = upload_route(&app, &owner, "Closed Ride", &gpx, "public", "easy").await;
+        sqlx::query("UPDATE routes SET photos_open=0 WHERE title='Closed Ride'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        let page = send(&app, "GET", &closed, Body::empty(), None, Some(&rider)).await;
+        assert!(body_text(page)
+            .await
+            .contains("turned off photo contributions"));
+        assert_eq!(
+            add_photos(&app, &rider, &private, 1, "").await.status(),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            add_photos(&app, &rider, &closed, 1, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            add_photos(&app, &owner, &private, 1, "").await.status(),
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(
+            add_photos(&app, &owner, &closed, 1, "").await.status(),
+            StatusCode::SEE_OTHER
+        );
+    }
+
+    #[tokio::test]
+    async fn per_route_photo_limit_refuses_whole_submission() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        add_photos(&app, &rider, &location, 2, "").await;
+        add_photos(&app, &rider, &location, 2, "").await;
+        let files = stored_files(&state);
+        let refused = add_photos(&app, &rider, &location, 3, "").await;
+        assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(body_text(refused)
+            .await
+            .contains("up to 5 photos to a route"));
+        assert_eq!(count(&state, "SELECT count(*) FROM route_images").await, 4);
+        assert_eq!(stored_files(&state), files);
+    }
+
+    #[tokio::test]
+    async fn unverified_daily_photo_limit_holds_under_parallel_requests() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let mut routes = Vec::new();
+        for i in 0..3 {
+            let gpx = TAIPEI_GPX.replace("<ele>5</ele>", &format!("<ele>{i}</ele>"));
+            routes.push(upload_route(&app, &owner, "River Ride", &gpx, "public", "easy").await);
+        }
+        let rider = unverified_rider(&app).await;
+        let mut adds = tokio::task::JoinSet::new();
+        for i in 0..12 {
+            let (app, rider, location) = (app.clone(), rider.clone(), routes[i % 3].clone());
+            adds.spawn(async move { add_photos(&app, &rider, &location, 1, "").await.status() });
+        }
+        let statuses = adds.join_all().await;
+        assert_eq!(count(&state, "SELECT count(*) FROM route_images").await, 10);
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|s| **s == StatusCode::SEE_OTHER)
+                .count(),
+            10
+        );
+        assert!(statuses
+            .iter()
+            .all(|s| *s == StatusCode::SEE_OTHER || *s == StatusCode::TOO_MANY_REQUESTS));
+    }
+
+    #[tokio::test]
+    async fn photo_submission_needs_a_file_and_no_honeypot() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        let empty = add_photos(&app, &rider, &location, 0, "").await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        assert!(body_text(empty).await.contains("Choose at least one photo"));
+        let bot = add_photos(&app, &rider, &location, 1, "spam.example").await;
+        assert_eq!(bot.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(count(&state, "SELECT count(*) FROM route_images").await, 0);
     }
 
     #[tokio::test]
