@@ -141,6 +141,15 @@ h1,h2,h3{font-family:var(--display);font-weight:700}
 .photo-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--gray)}
 .photo-meta a{color:var(--black);font-weight:700}
 .photo-more{margin-top:16px}
+.photo-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.like-button,.text-button{border:1px solid var(--line);background:var(--white);color:var(--black);border-radius:var(--pill);padding:4px 12px;font-size:13px;cursor:pointer}
+.like-button.liked{background:var(--lime);border-color:var(--lime)}
+.text-button{border-color:transparent;text-decoration:underline}
+.photo-report summary{cursor:pointer;color:var(--gray);font-size:13px}
+.photo-report form{display:grid;gap:8px;margin-top:8px}
+.photo-report label{display:flex;flex-direction:column;gap:4px;font-weight:700}
+.photo-report select,.photo-report textarea{width:100%;border:1px solid var(--line);border-radius:var(--r-control);padding:8px;font-size:13px}
+.admin-photo{border-radius:var(--r-thumb);object-fit:cover}
 .route-attribution{padding:32px 0;border-top:1px solid var(--line)}
 .author-line{display:flex;align-items:center;gap:12px;font-weight:700}
 .author-line img{border-radius:50%;width:44px;height:44px;object-fit:cover}

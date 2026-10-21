@@ -387,6 +387,7 @@ async fn route_photos(
     data["route"] = route_json(&r);
     data["photos"] = json!(photos);
     data["photo_count"] = json!(total);
+    data["back"] = json!(format!("/routes/{}/photos?page={page}", r.slug));
     data["page_number"] = json!(page);
     data["has_prev"] = json!(page > 1);
     data["has_next"] = json!(page * 24 < total);
@@ -630,6 +631,10 @@ fn router(state: Shared) -> Router {
         .route("/routes/{slug}/delete", post(delete_route))
         .route("/routes/{slug}/report", post(report_route))
         .route("/routes/{slug}/photos", get(route_photos).post(add_photos))
+        .route("/routes/{slug}/photos/{id}/like", post(like_photo))
+        .route("/routes/{slug}/photos/{id}/unlike", post(unlike_photo))
+        .route("/routes/{slug}/photos/{id}/delete", post(delete_photo))
+        .route("/routes/{slug}/photos/{id}/report", post(report_photo))
         .route("/users/{username}", get(profile))
         .route("/users/{username}/avatar", get(avatar))
         .route("/dashboard", get(dashboard))
@@ -792,6 +797,7 @@ async fn route_detail(
     photos.extend(photo_rows(&state, &r, v.user.as_ref(), PhotoFilter::Others, 6, 0).await?);
     let total = photo_count(&state, &r).await?;
     data["more_photos"] = json!(total > photos.len() as i64);
+    data["back"] = json!(format!("/routes/{}", r.slug));
     data["photo_count"] = json!(total);
     data["photos"] = json!(photos);
     let can_add = v.user.as_ref().is_some_and(|u| may_add_photo(&r, u));
@@ -1716,13 +1722,15 @@ async fn delete_account(
             .await
             .map_err(AppError::internal)?;
     let photos: Vec<String> = sqlx::query_scalar(
-        "SELECT i.image_key FROM route_images i JOIN routes r ON r.id=i.route_id WHERE r.author_id=?",
+        "SELECT i.image_key FROM route_images i JOIN routes r ON r.id=i.route_id WHERE r.author_id=? OR i.uploader_id=?",
     )
+    .bind(&u.id)
     .bind(&u.id)
     .fetch_all(&state.pool)
     .await
     .map_err(AppError::internal)?;
-    // Cascades remove sessions, verification links, routes, their photos and reports.
+    // Cascades remove sessions, verification links, routes, their photos and reports,
+    // and the photos and likes this rider added to other routes.
     sqlx::query("DELETE FROM users WHERE id=?")
         .bind(&u.id)
         .execute(&state.pool)
@@ -1810,14 +1818,7 @@ async fn report_route(
     if r.visibility == "private" {
         return Err(AppError::not_found());
     }
-    let reason = val(&form, "reason");
-    if !valid_choice(reason, &["misleading", "copyright", "unsafe", "other"]) {
-        return Err(AppError::bad("Choose a report reason"));
-    }
-    let details = val(&form, "details").trim();
-    if details.len() > 1000 {
-        return Err(AppError::bad("Report details are too long"));
-    }
+    let (reason, details) = report_fields(&form)?;
     let report_id = Uuid::new_v4().to_string();
     sqlx::query(
         "INSERT INTO route_reports(id,route_id,reporter_id,reason,details) VALUES (?,?,?,?,?)",
@@ -1836,6 +1837,137 @@ async fn report_route(
         "Report received. Thank you",
     ))
 }
+fn report_fields(form: &HashMap<String, String>) -> Result<(&str, &str), AppError> {
+    let reason = val(form, "reason");
+    if !valid_choice(reason, &["misleading", "copyright", "unsafe", "other"]) {
+        return Err(AppError::bad("Choose a report reason"));
+    }
+    let details = val(form, "details").trim();
+    if details.len() > 1000 {
+        return Err(AppError::bad("Report details are too long"));
+    }
+    Ok((reason, details))
+}
+/// Where a photo form returns to: a page of this route, or the route itself.
+fn safe_back(form: &HashMap<String, String>, slug: &str) -> String {
+    let base = format!("/routes/{slug}");
+    let back = val(form, "back");
+    let on_route = back == base
+        || back.starts_with(&format!("{base}/"))
+        || back.starts_with(&format!("{base}?"));
+    if on_route && back.bytes().all(|b| b.is_ascii_graphic()) {
+        back.to_owned()
+    } else {
+        base
+    }
+}
+/// A photo of a route the viewer can see, with its uploader and file; 404 otherwise.
+async fn viewable_photo(
+    state: &AppState,
+    slug: &str,
+    id: &str,
+    viewer: Option<&User>,
+) -> Result<(RouteRecord, String, String), AppError> {
+    let r = get_route(&state.pool, slug).await?;
+    if !can_view(&r, viewer) {
+        return Err(AppError::not_found());
+    }
+    let (uploader, key): (String, String) =
+        sqlx::query_as("SELECT uploader_id,image_key FROM route_images WHERE id=? AND route_id=?")
+            .bind(id)
+            .bind(&r.id)
+            .fetch_optional(&state.pool)
+            .await
+            .map_err(AppError::internal)?
+            .ok_or_else(AppError::not_found)?;
+    Ok((r, uploader, key))
+}
+async fn like_photo(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((slug, id)): Path<(String, String)>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    csrf(&headers, &form, &v, &state)?;
+    let (_, uploader, _) = viewable_photo(&state, &slug, &id, Some(user)).await?;
+    if !route::may_like_photo(true, &uploader, &user.id) {
+        return Err(AppError::forbidden());
+    }
+    sqlx::query("INSERT OR IGNORE INTO photo_likes(image_id,user_id) VALUES (?,?)")
+        .bind(&id)
+        .bind(&user.id)
+        .execute(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(redirect(&format!("{}#photo-{id}", safe_back(&form, &slug))))
+}
+async fn unlike_photo(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((slug, id)): Path<(String, String)>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    csrf(&headers, &form, &v, &state)?;
+    viewable_photo(&state, &slug, &id, Some(user)).await?;
+    sqlx::query("DELETE FROM photo_likes WHERE image_id=? AND user_id=?")
+        .bind(&id)
+        .bind(&user.id)
+        .execute(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    Ok(redirect(&format!("{}#photo-{id}", safe_back(&form, &slug))))
+}
+async fn delete_photo(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((slug, id)): Path<(String, String)>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    let user = require_user(&v)?;
+    csrf(&headers, &form, &v, &state)?;
+    let (r, uploader, key) = viewable_photo(&state, &slug, &id, Some(user)).await?;
+    // The route owner reports other riders' photos; only their uploader or an admin deletes them.
+    if !route::may_edit(&uploader, &user.id, user.is_admin != 0) {
+        return Err(AppError::forbidden());
+    }
+    sqlx::query("DELETE FROM route_images WHERE id=?")
+        .bind(&id)
+        .execute(&state.pool)
+        .await
+        .map_err(AppError::internal)?;
+    remove_assets(&state, [key]).await;
+    tracing::info!(route_id = %r.id, user_id = %user.id, photo_id = %id, "photo deleted");
+    Ok(msg_redirect(&safe_back(&form, &slug), "Photo deleted"))
+}
+async fn report_photo(
+    State(state): State<Shared>,
+    headers: HeaderMap,
+    Path((slug, id)): Path<(String, String)>,
+    Form(form): Form<HashMap<String, String>>,
+) -> WebResult {
+    let v = viewer(&state, &headers).await;
+    csrf(&headers, &form, &v, &state)?;
+    let (r, _, _) = viewable_photo(&state, &slug, &id, v.user.as_ref()).await?;
+    if r.visibility == "private" {
+        return Err(AppError::not_found());
+    }
+    let (reason, details) = report_fields(&form)?;
+    let report_id = Uuid::new_v4().to_string();
+    sqlx::query("INSERT INTO route_reports(id,route_id,reporter_id,reason,details,image_id) VALUES (?,?,?,?,?,?)")
+        .bind(&report_id).bind(&r.id).bind(v.user.as_ref().map(|u| u.id.as_str()))
+        .bind(reason).bind(details).bind(&id)
+        .execute(&state.pool).await.map_err(AppError::internal)?;
+    tracing::info!(%report_id, route_id = %r.id, photo_id = %id, reason, signed_in = v.user.is_some(), "photo reported");
+    Ok(msg_redirect(
+        &safe_back(&form, &slug),
+        "Report received. Thank you",
+    ))
+}
 async fn admin(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
     let v = viewer(&state, &headers).await;
     let u = require_user(&v)?;
@@ -1844,7 +1976,7 @@ async fn admin(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
     }
     let users:Vec<User>=sqlx::query_as("SELECT id,username,email,bio,avatar_key,email_verified_at,contributor_verified_at,is_admin FROM users ORDER BY created_at DESC LIMIT 100")
         .fetch_all(&state.pool).await.map_err(AppError::internal)?;
-    let reports:Vec<(String,String,String,String,String,String)>=sqlx::query_as("SELECT rr.id,r.slug,r.title,rr.reason,rr.details,rr.status FROM route_reports rr JOIN routes r ON r.id=rr.route_id ORDER BY rr.created_at DESC LIMIT 100")
+    let reports:Vec<(String,String,String,String,String,String,Option<String>)>=sqlx::query_as("SELECT rr.id,r.slug,r.title,rr.reason,rr.details,rr.status,rr.image_id FROM route_reports rr JOIN routes r ON r.id=rr.route_id ORDER BY rr.created_at DESC LIMIT 100")
         .fetch_all(&state.pool).await.map_err(AppError::internal)?;
     let total_users: i64 = sqlx::query_scalar("SELECT count(*) FROM users")
         .fetch_one(&state.pool)
@@ -1862,7 +1994,7 @@ async fn admin(State(state): State<Shared>, headers: HeaderMap) -> WebResult {
     let mut data = base_context(&state, &v, "Administration", "admin");
     data["stats"] = json!({"users":total_users,"routes":total_routes,"reports":open_reports});
     data["users"]=json!(users.iter().map(|u|json!({"id":u.id,"username":u.username,"email":u.email,"email_verified":u.email_verified_at.is_some(),"contributor":u.contributor_verified_at.is_some()})).collect::<Vec<_>>());
-    data["reports"]=json!(reports.iter().map(|(id,slug,title,reason,details,status)|json!({"id":id,"slug":slug,"title":title,"reason":reason,"details":details,"status":status,"open":status=="open"})).collect::<Vec<_>>());
+    data["reports"]=json!(reports.iter().map(|(id,slug,title,reason,details,status,image)|json!({"id":id,"slug":slug,"title":title,"reason":reason,"details":details,"status":status,"open":status=="open","photo":image.as_ref().map(|i|format!("/routes/{slug}/images/{i}"))})).collect::<Vec<_>>());
     render(&state, v, data)
 }
 async fn admin_contributor(
@@ -1896,22 +2028,32 @@ async fn admin_report(
     }
     csrf(&headers, &form, &v, &state)?;
     let action = val(&form, "action");
-    let route_id: Option<String> =
-        sqlx::query_scalar("SELECT route_id FROM route_reports WHERE id=?")
+    let (route_id, image_id): (String, Option<String>) =
+        sqlx::query_as("SELECT route_id,image_id FROM route_reports WHERE id=?")
             .bind(&id)
             .fetch_optional(&state.pool)
             .await
-            .map_err(AppError::internal)?;
-    let route_id = route_id.ok_or_else(AppError::not_found)?;
-    match action {
-        "dismiss" => {
+            .map_err(AppError::internal)?
+            .ok_or_else(AppError::not_found)?;
+    match (action, image_id) {
+        // Removing a photo deletes it; its reports go with it.
+        ("remove", Some(image_id)) => {
+            let key: Option<String> =
+                sqlx::query_scalar("DELETE FROM route_images WHERE id=? RETURNING image_key")
+                    .bind(&image_id)
+                    .fetch_optional(&state.pool)
+                    .await
+                    .map_err(AppError::internal)?;
+            remove_assets(&state, key).await;
+        }
+        ("dismiss", _) => {
             sqlx::query("UPDATE route_reports SET status='dismissed' WHERE id=?")
                 .bind(&id)
                 .execute(&state.pool)
                 .await
                 .map_err(AppError::internal)?;
         }
-        "remove" => {
+        ("remove", None) => {
             let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
             sqlx::query(
                 "UPDATE routes SET visibility='private',updated_at=datetime('now') WHERE id=?",
@@ -2173,6 +2315,228 @@ mod tests {
 
     fn stored_files(state: &Shared) -> usize {
         std::fs::read_dir(&state.storage).unwrap().count()
+    }
+
+    async fn photo_post(app: &Router, session: &str, path: &str, extra: &str) -> Response {
+        let page = send(app, "GET", "/upload", Body::empty(), None, Some(session)).await;
+        let csrf = field(&body_text(page).await, "csrf");
+        send(
+            app,
+            "POST",
+            path,
+            Body::from(format!("csrf={csrf}{extra}")),
+            Some("application/x-www-form-urlencoded"),
+            Some(session),
+        )
+        .await
+    }
+
+    async fn first_photo(state: &Shared) -> (String, String) {
+        sqlx::query_as("SELECT id,image_key FROM route_images ORDER BY created_at LIMIT 1")
+            .fetch_one(&state.pool)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn likes_count_once_and_can_be_removed() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        add_photos(&app, &rider, &location, 1, "").await;
+        let (id, _) = first_photo(&state).await;
+        let like = format!("{location}/photos/{id}/like");
+        assert_eq!(
+            photo_post(&app, &owner, &like, "").await.status(),
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(
+            photo_post(&app, &owner, &like, "").await.status(),
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(count(&state, "SELECT count(*) FROM photo_likes").await, 1);
+        let unlike = format!("{location}/photos/{id}/unlike");
+        assert_eq!(
+            photo_post(&app, &owner, &unlike, "").await.status(),
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(count(&state, "SELECT count(*) FROM photo_likes").await, 0);
+        assert_eq!(
+            photo_post(&app, &rider, &like, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[tokio::test]
+    async fn photo_actions_check_the_route_and_visibility() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let first = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        let gpx = TAIPEI_GPX.replace("<ele>5</ele>", "<ele>6</ele>");
+        let other = upload_route(&app, &owner, "Other Ride", &gpx, "public", "easy").await;
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        add_photos(&app, &owner, &first, 1, "").await;
+        let (id, _) = first_photo(&state).await;
+        for action in ["like", "delete", "report"] {
+            let wrong = photo_post(
+                &app,
+                &owner,
+                &format!("{other}/photos/{id}/{action}"),
+                "&reason=other",
+            )
+            .await;
+            assert_eq!(wrong.status(), StatusCode::NOT_FOUND, "{action}");
+        }
+        let right = photo_post(&app, &rider, &format!("{first}/photos/{id}/like"), "").await;
+        assert_eq!(right.status(), StatusCode::SEE_OTHER);
+        sqlx::query("DELETE FROM photo_likes")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE routes SET visibility='private'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let hidden = photo_post(&app, &rider, &format!("{first}/photos/{id}/like"), "").await;
+        assert_eq!(hidden.status(), StatusCode::NOT_FOUND);
+        assert_eq!(count(&state, "SELECT count(*) FROM route_images").await, 1);
+    }
+
+    #[tokio::test]
+    async fn back_field_cannot_leave_the_route() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        add_photos(&app, &owner, &location, 1, "").await;
+        let (id, _) = first_photo(&state).await;
+        let like = format!("{location}/photos/{id}/like");
+        for back in [
+            "%2F%2Fevil.example",
+            "https%3A%2F%2Fevil.example",
+            "%2Froutes%2Fx%0D%0A",
+        ] {
+            let liked = photo_post(&app, &rider, &like, &format!("&back={back}")).await;
+            assert_eq!(liked.status(), StatusCode::SEE_OTHER);
+            assert_eq!(
+                liked.headers()[header::LOCATION],
+                format!("{location}#photo-{id}").as_str()
+            );
+        }
+        let gallery = photo_post(
+            &app,
+            &rider,
+            &format!("{location}/photos/{id}/unlike"),
+            &format!("&back={}%2Fphotos%3Fpage%3D2", location.replace('/', "%2F")),
+        )
+        .await;
+        assert_eq!(
+            gallery.headers()[header::LOCATION],
+            format!("{location}/photos?page=2#photo-{id}").as_str()
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_cannot_delete_other_riders_photos() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        let admin = signed_in_as(&app, &state, "admin_rider").await;
+        sqlx::query("UPDATE users SET is_admin=1 WHERE username='admin_rider'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        add_photos(&app, &rider, &location, 2, "").await;
+        let (id, key) = first_photo(&state).await;
+        let delete = format!("{location}/photos/{id}/delete");
+        assert_eq!(
+            photo_post(&app, &owner, &delete, "").await.status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            photo_post(&app, &rider, &delete, "").await.status(),
+            StatusCode::SEE_OTHER
+        );
+        assert!(!state.storage.join(&key).exists());
+        let (id, _) = first_photo(&state).await;
+        let delete = format!("{location}/photos/{id}/delete");
+        assert_eq!(
+            photo_post(&app, &admin, &delete, "").await.status(),
+            StatusCode::SEE_OTHER
+        );
+        assert_eq!(count(&state, "SELECT count(*) FROM route_images").await, 0);
+    }
+
+    #[tokio::test]
+    async fn admin_removes_reported_photo_without_hiding_route() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        let admin = signed_in_as(&app, &state, "admin_rider").await;
+        sqlx::query("UPDATE users SET is_admin=1 WHERE username='admin_rider'")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        add_photos(&app, &rider, &location, 1, "").await;
+        let (id, key) = first_photo(&state).await;
+        let reported = photo_post(
+            &app,
+            &owner,
+            &format!("{location}/photos/{id}/report"),
+            "&reason=other&details=Not+this+route",
+        )
+        .await;
+        assert_eq!(reported.status(), StatusCode::SEE_OTHER);
+        let report: String =
+            sqlx::query_scalar("SELECT id FROM route_reports WHERE image_id IS NOT NULL")
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        let list =
+            body_text(send(&app, "GET", "/admin", Body::empty(), None, Some(&admin)).await).await;
+        assert!(list.contains(&format!("{location}/images/{id}")));
+        assert!(list.contains("Remove photo"));
+        let removed = photo_post(
+            &app,
+            &admin,
+            &format!("/admin/reports/{report}"),
+            "&action=remove",
+        )
+        .await;
+        assert_eq!(removed.status(), StatusCode::SEE_OTHER);
+        assert_eq!(count(&state, "SELECT count(*) FROM route_images").await, 0);
+        assert!(!state.storage.join(&key).exists());
+        assert_eq!(
+            count(
+                &state,
+                "SELECT count(*) FROM routes WHERE visibility='public'"
+            )
+            .await,
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_account_removes_photos_on_other_routes() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        let rider = signed_in_as(&app, &state, "second_rider").await;
+        add_photos(&app, &rider, &location, 1, "").await;
+        let (_, key) = first_photo(&state).await;
+        let deleted = photo_post(
+            &app,
+            &rider,
+            "/account/delete",
+            "&password=a+very+long+test+password",
+        )
+        .await;
+        assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+        assert_eq!(count(&state, "SELECT count(*) FROM route_images").await, 0);
+        assert!(!state.storage.join(&key).exists());
     }
 
     #[test]
