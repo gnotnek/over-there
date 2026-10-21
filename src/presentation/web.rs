@@ -394,6 +394,17 @@ async fn route_photos(
     data["next_page"] = json!(page + 1);
     render(&state, v, data)
 }
+fn photo_limit_reached(per_route: bool) -> AppError {
+    AppError(
+        StatusCode::TOO_MANY_REQUESTS,
+        if per_route {
+            "You can add up to 5 photos to a route".into()
+        } else {
+            "Unverified accounts can add 10 photos a day. Verify your email to remove the limit"
+                .into()
+        },
+    )
+}
 fn may_add_photo(r: &RouteRecord, user: &User) -> bool {
     route::may_add_photo(
         Visibility::parse(&r.visibility).unwrap_or(Visibility::Private),
@@ -1218,7 +1229,11 @@ fn optimized_image(bytes: &[u8], max: u32) -> Result<Vec<u8>, AppError> {
     if image.width() as u64 * image.height() as u64 > 30_000_000 {
         return Err(AppError::bad("Image dimensions are too large"));
     }
-    let image = image.resize(max, max, image::imageops::FilterType::Lanczos3);
+    let image = if image.width() > max || image.height() > max {
+        image.resize(max, max, image::imageops::FilterType::Lanczos3)
+    } else {
+        image
+    };
     let mut out = std::io::Cursor::new(Vec::new());
     image
         .write_to(&mut out, ImageFormat::WebP)
@@ -1372,6 +1387,17 @@ async fn add_photos(
     if !may_add_photo(&r, user) {
         return Err(AppError::forbidden());
     }
+    let verified = user.email_verified_at.is_some();
+    // Cheap early rejection before decoding images; the insert below enforces the limits atomically.
+    let (on_route, today): (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM route_images WHERE route_id=? AND uploader_id=?),(SELECT count(*) FROM route_images WHERE uploader_id=? AND created_at>datetime('now','-1 day'))")
+        .bind(&r.id).bind(&user.id).bind(&user.id)
+        .fetch_one(&state.pool).await.map_err(AppError::internal)?;
+    if on_route >= PHOTOS_PER_RIDER_PER_ROUTE {
+        return Err(photo_limit_reached(true));
+    }
+    if !verified && today >= UNVERIFIED_DAILY_PHOTOS {
+        return Err(photo_limit_reached(false));
+    }
     let mut photos = Vec::new();
     for n in 1..=3 {
         let Some(image) = files.remove(&format!("photo{n}")).filter(|f| !f.is_empty()) else {
@@ -1381,7 +1407,11 @@ async fn add_photos(
         if caption.chars().count() > 120 {
             return Err(AppError::bad("Captions must be 120 characters or less"));
         }
-        photos.push((optimized_image(&image, 1600)?, caption.to_owned()));
+        // Decoding and resizing is CPU work; keep it off the request threads.
+        let bytes = tokio::task::spawn_blocking(move || optimized_image(&image, 1600))
+            .await
+            .map_err(AppError::internal)??;
+        photos.push((bytes, caption.to_owned()));
     }
     if photos.is_empty() {
         return Err(AppError::bad("Choose at least one photo"));
@@ -1390,7 +1420,6 @@ async fn add_photos(
     for (bytes, _) in &photos {
         keys.push(write_asset(&state, bytes, "webp").await?);
     }
-    let verified = user.email_verified_at.is_some();
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
     let mut refused = None;
     for (key, (_, caption)) in keys.iter().zip(&photos) {
@@ -1411,14 +1440,7 @@ async fn add_photos(
                 .fetch_one(&mut *tx)
                 .await
                 .unwrap_or(0);
-                refused = Some(AppError(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    if on_route >= PHOTOS_PER_RIDER_PER_ROUTE {
-                        "You can add up to 5 photos to a route".into()
-                    } else {
-                        "Unverified accounts can add 10 photos a day. Verify your email to remove the limit".into()
-                    },
-                ));
+                refused = Some(photo_limit_reached(on_route >= PHOTOS_PER_RIDER_PER_ROUTE));
                 break;
             }
             Err(e) => {
@@ -2153,6 +2175,12 @@ mod tests {
         std::fs::read_dir(&state.storage).unwrap().count()
     }
 
+    #[test]
+    fn small_images_are_not_enlarged() {
+        let out = image::load_from_memory(&optimized_image(&png(), 1600).unwrap()).unwrap();
+        assert_eq!((out.width(), out.height()), (8, 8));
+    }
+
     #[tokio::test]
     async fn riders_add_photos_to_someone_elses_public_route() {
         let (app, state, _dir) = setup().await;
@@ -2245,9 +2273,12 @@ mod tests {
                 .count(),
             10
         );
-        assert!(statuses
-            .iter()
-            .all(|s| *s == StatusCode::SEE_OTHER || *s == StatusCode::TOO_MANY_REQUESTS));
+        assert!(
+            statuses
+                .iter()
+                .all(|s| *s == StatusCode::SEE_OTHER || *s == StatusCode::TOO_MANY_REQUESTS),
+            "{statuses:?}"
+        );
     }
 
     #[tokio::test]
