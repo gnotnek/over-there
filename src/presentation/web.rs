@@ -215,7 +215,7 @@ fn route_json(r: &RouteRecord) -> Value {
         "duration":r.duration_s.map(format_duration),"downloads":r.download_count,
         "cover":r.cover_key.as_ref().map(|_| format!("/routes/{}/cover",r.slug)),
         "preview": preview_svg(&r.geometry_json), "created":r.created_at.get(..10).unwrap_or(&r.created_at),
-        "endpoint_hidden":r.hide_endpoints_m>0.0,
+        "endpoint_hidden":r.hide_endpoints_m>0.0,"photos_open":r.photos_open!=0,
     })
 }
 /// Map pins for listed routes, at the first point of their public geometry.
@@ -1194,14 +1194,14 @@ async fn upload(
         .as_ref()
         .map(|e| serde_json::to_string(e).unwrap());
     let mut tx = state.pool.begin().await.map_err(AppError::internal)?;
-    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon,plan_json) SELECT ?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ? OR (SELECT count(*) FROM routes WHERE author_id=? AND created_at>datetime('now','-1 day'))<?")
+    let result=sqlx::query("INSERT INTO routes(id,author_id,slug,title,description,activity,cycling_type,region,country,difficulty,tags,visibility,gpx_key,public_gpx_key,gpx_sha256,hide_endpoints_m,geometry_json,elevation_json,distance_m,elevation_gain_m,elevation_loss_m,duration_s,cover_key,min_lat,max_lat,min_lon,max_lon,plan_json,photos_open) SELECT ?,?,?,?,?,'cycling',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE ? OR (SELECT count(*) FROM routes WHERE author_id=? AND created_at>datetime('now','-1 day'))<?")
         .bind(&id).bind(&user.id).bind(&slug).bind(&draft.title).bind(&draft.description)
         .bind(&draft.cycling_type).bind(&draft.region).bind(&draft.country)
         .bind(&draft.difficulty).bind(&draft.tags).bind(draft.visibility_str())
         .bind(&gpx_key).bind(&public_gpx_key).bind(&sha).bind(hide).bind(&geometry).bind(&elevation)
         .bind(parsed.distance_m).bind(parsed.gain_m).bind(parsed.loss_m).bind(parsed.duration_s).bind(&cover_key)
         .bind(route_box.map(|b| b.min_lat)).bind(route_box.map(|b| b.max_lat)).bind(route_box.map(|b| b.min_lon)).bind(route_box.map(|b| b.max_lon))
-        .bind(&plan)
+        .bind(&plan).bind(draft.photos_open)
         .bind(verified).bind(&user.id).bind(UNVERIFIED_DAILY_ROUTES)
         .execute(&mut *tx).await;
     if !matches!(result, Ok(ref done) if done.rows_affected() == 1) {
@@ -1215,11 +1215,12 @@ async fn upload(
         });
     }
     for (position, key) in photo_keys.iter().enumerate() {
-        sqlx::query("INSERT INTO route_images(id,route_id,image_key,position) VALUES (?,?,?,?)")
+        sqlx::query("INSERT INTO route_images(id,route_id,image_key,position,uploader_id,created_at) VALUES (?,?,?,?,?,datetime('now'))")
             .bind(Uuid::new_v4().to_string())
             .bind(&id)
             .bind(key)
             .bind(position as i64)
+            .bind(&user.id)
             .execute(&mut *tx)
             .await
             .map_err(AppError::internal)?;
@@ -1380,10 +1381,10 @@ async fn edit_route(
         return Err(AppError::forbidden());
     }
     let draft = RouteDraft::from_fields(&form).map_err(AppError::bad)?;
-    sqlx::query("UPDATE routes SET title=?,description=?,cycling_type=?,region=?,country=?,difficulty=?,tags=?,visibility=?,updated_at=datetime('now') WHERE id=?")
+    sqlx::query("UPDATE routes SET title=?,description=?,cycling_type=?,region=?,country=?,difficulty=?,tags=?,visibility=?,photos_open=?,updated_at=datetime('now') WHERE id=?")
         .bind(&draft.title).bind(&draft.description).bind(&draft.cycling_type)
         .bind(&draft.region).bind(&draft.country).bind(&draft.difficulty)
-        .bind(&draft.tags).bind(draft.visibility_str()).bind(&r.id)
+        .bind(&draft.tags).bind(draft.visibility_str()).bind(draft.photos_open).bind(&r.id)
         .execute(&state.pool).await.map_err(AppError::internal)?;
     tracing::info!(route_id = %r.id, user_id = %user.id, visibility = draft.visibility_str(), "route updated");
     Ok(redirect(&format!("/routes/{slug}")))
@@ -1888,6 +1889,7 @@ mod tests {
             ("tags", "river"),
             ("visibility", visibility),
             ("hide_endpoints", "250"),
+            ("photos_open", "1"),
             ("website", website),
         ] {
             multipart.push_str(&format!("--test-boundary\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{value}\r\n"));
@@ -1902,6 +1904,38 @@ mod tests {
             Some(session),
         )
         .await
+    }
+
+    #[tokio::test]
+    async fn owner_switch_is_saved_on_upload_and_edit() {
+        let (app, state, _dir) = setup().await;
+        let session = signed_in_rider(&app, &state).await;
+        let location =
+            upload_route(&app, &session, "Switch Ride", TAIPEI_GPX, "public", "easy").await;
+        let open = "SELECT photos_open FROM routes";
+        assert_eq!(count(&state, open).await, 1);
+        let edit_page = send(
+            &app,
+            "GET",
+            &format!("{location}/edit"),
+            Body::empty(),
+            None,
+            Some(&session),
+        )
+        .await;
+        let csrf = field(&body_text(edit_page).await, "csrf");
+        let form = format!("csrf={csrf}&title=Switch+Ride&description=&cycling_type=road&region=Taipei&country=Taiwan&difficulty=easy&tags=&visibility=public");
+        let edited = send(
+            &app,
+            "POST",
+            &format!("{location}/edit"),
+            Body::from(form),
+            Some("application/x-www-form-urlencoded"),
+            Some(&session),
+        )
+        .await;
+        assert_eq!(edited.status(), StatusCode::SEE_OTHER);
+        assert_eq!(count(&state, open).await, 0);
     }
 
     #[tokio::test]

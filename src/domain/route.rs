@@ -29,6 +29,18 @@ pub fn may_view(
 pub fn may_edit(owner_id: &str, actor_id: &str, is_admin: bool) -> bool {
     owner_id == actor_id || is_admin
 }
+/// Other riders may add photos to routes they can open by link, unless the owner turned that off.
+pub fn may_add_photo(
+    visibility: Visibility,
+    photos_open: bool,
+    owner_id: &str,
+    actor_id: &str,
+) -> bool {
+    owner_id == actor_id || (visibility != Visibility::Private && photos_open)
+}
+pub fn may_like_photo(can_view: bool, uploader_id: &str, actor_id: &str) -> bool {
+    can_view && uploader_id != actor_id
+}
 
 #[derive(Clone, Debug)]
 pub struct RouteDraft {
@@ -40,6 +52,8 @@ pub struct RouteDraft {
     pub difficulty: String,
     pub tags: String,
     pub visibility: Visibility,
+    /// Unchecked boxes are not submitted, so a missing field means contributions are off.
+    pub photos_open: bool,
 }
 impl RouteDraft {
     pub fn from_fields(fields: &HashMap<String, String>) -> Result<Self, String> {
@@ -60,6 +74,7 @@ impl RouteDraft {
             difficulty: get("difficulty"),
             tags: get("tags"),
             visibility: Visibility::parse(&get("visibility"))?,
+            photos_open: fields.contains_key("photos_open"),
         };
         if draft.title.len() < 4 || draft.title.len() > 100 {
             return Err("Title must be 4–100 characters".into());
@@ -134,6 +149,23 @@ mod tests {
         ));
         assert!(may_view(Visibility::Private, "owner", Some("owner"), false));
         assert!(may_view(Visibility::Private, "owner", None, true));
+    }
+    #[test]
+    fn photo_rules_follow_visibility_switch_and_authorship() {
+        assert!(may_add_photo(Visibility::Private, false, "owner", "owner"));
+        assert!(may_add_photo(Visibility::Public, true, "owner", "rider"));
+        assert!(may_add_photo(Visibility::Unlisted, true, "owner", "rider"));
+        assert!(!may_add_photo(Visibility::Public, false, "owner", "rider"));
+        assert!(!may_add_photo(
+            Visibility::Unlisted,
+            false,
+            "owner",
+            "rider"
+        ));
+        assert!(!may_add_photo(Visibility::Private, true, "owner", "rider"));
+        assert!(!may_like_photo(true, "a", "a"));
+        assert!(may_like_photo(true, "a", "b"));
+        assert!(!may_like_photo(false, "a", "b"));
     }
     #[test]
     fn public_and_unlisted_are_link_viewable() {
