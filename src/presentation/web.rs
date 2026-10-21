@@ -206,7 +206,8 @@ fn msg_redirect(path: &str, message: &str) -> Response {
             }
         })
         .collect::<String>();
-    redirect(&format!("{path}?notice={q}"))
+    let join = if path.contains('?') { '&' } else { '?' };
+    redirect(&format!("{path}{join}notice={q}"))
 }
 fn route_json(r: &RouteRecord) -> Value {
     json!({
@@ -2435,6 +2436,29 @@ mod tests {
             gallery.headers()[header::LOCATION],
             format!("{location}/photos?page=2#photo-{id}").as_str()
         );
+    }
+
+    #[tokio::test]
+    async fn deleting_from_a_gallery_page_returns_to_a_working_page() {
+        let (app, state, _dir) = setup().await;
+        let owner = signed_in_as(&app, &state, "owner_rider").await;
+        let location = upload_route(&app, &owner, "River Ride", TAIPEI_GPX, "public", "easy").await;
+        add_photos(&app, &owner, &location, 1, "").await;
+        let (id, _) = first_photo(&state).await;
+        let back = format!("&back={}%2Fphotos%3Fpage%3D2", location.replace('/', "%2F"));
+        let deleted = photo_post(
+            &app,
+            &owner,
+            &format!("{location}/photos/{id}/delete"),
+            &back,
+        )
+        .await;
+        let target = deleted.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let page = send(&app, "GET", &target, Body::empty(), None, Some(&owner)).await;
+        assert_eq!(page.status(), StatusCode::OK, "{target}");
     }
 
     #[tokio::test]
