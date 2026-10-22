@@ -34,6 +34,10 @@ erDiagram
     users ||--o{ routes : "authors"
     users |o--o{ route_reports : "files (optional)"
     routes ||--o{ route_images : "has photos"
+    users ||--o{ route_images : "adds"
+    route_images ||--o{ photo_likes : "receives"
+    users ||--o{ photo_likes : "likes"
+    route_images |o--o{ route_reports : "is reported (optional)"
     routes ||--o{ route_reports : "receives"
 ```
 
@@ -138,6 +142,7 @@ The core entity. Inserted by `upload`, updated by `edit_route`, `download` and m
 | `plan_json` | TEXT | yes | Drawn routes only: `{"points","at","straight"}` (see [contracts](contracts.md#drawn-line)), so the owner can edit the line. Holds the exact start and finish even when endpoints are hidden, so it is only sent to the owner's line editor. Null for uploaded GPX | Owner |
 | `created_at` | TEXT | no | Upload time; default sort order | Gated |
 | `updated_at` | TEXT | no | Set on edit and on moderation removal | Gated |
+| `photos_open` | INTEGER | no | 1 when other riders may add photos (default), 0 when the owner turned it off. Set on upload and edit | Public |
 
 Indexes: `routes_discover_idx (visibility, created_at DESC)`, `routes_author_idx (author_id, created_at DESC)`, `routes_search_idx (visibility, cycling_type, difficulty, distance_m)`, `routes_duplicate_idx (author_id, gpx_sha256)`, `routes_bbox_idx (visibility, min_lat, max_lat)`.
 
@@ -145,14 +150,29 @@ Indexes: `routes_discover_idx (visibility, created_at DESC)`, `routes_author_idx
 
 ### `route_images`
 
-Additional photos (up to three per route, set at upload).
+Photos of a route, from its owner (up to three at upload, more later) and from other riders. Inserted by `upload` and `add_photos`, deleted by `delete_photo`, `admin_report` and the route and account cascades. At most 5 per uploader per route, and 10 per rolling day for uploaders without a verified email; both checked inside the insert.
 
 | Column | Type | Null | Meaning and rules | Class |
 | --- | --- | --- | --- | --- |
 | `id` | TEXT PK | no | UUID v4, used in `/routes/{slug}/images/{id}` | Gated |
 | `route_id` | TEXT FK → routes | no | `ON DELETE CASCADE` | Gated |
 | `image_key` | TEXT | no | Storage key, WebP, longest side ≤ 1600 px | Gated |
-| `position` | INTEGER | no | Display order, 0-based | Gated |
+| `position` | INTEGER | no | Display order, 0-based; orders the owner's photos | Gated |
+| `uploader_id` | TEXT FK → users | yes | Rider who added it; `ON DELETE CASCADE`. Backfilled with the route author for photos stored before this column. Null never written | Gated |
+| `caption` | TEXT | no | Up to 120 chars, empty by default | Gated |
+| `created_at` | TEXT | yes | Set on every insert; no default because `ALTER TABLE` cannot add one. Backfilled with the route's `created_at` | Gated |
+
+Indexes: `route_images_uploader_idx (uploader_id, created_at)`.
+
+### `photo_likes`
+
+One like per rider per photo. Inserted by `like_photo` (`INSERT OR IGNORE`), deleted by `unlike_photo` and the photo and user cascades. Likes rank other riders' photos on the route page and the gallery.
+
+| Column | Type | Null | Meaning and rules | Class |
+| --- | --- | --- | --- | --- |
+| `image_id` | TEXT FK → route_images | no | `ON DELETE CASCADE`; part of the primary key | Gated |
+| `user_id` | TEXT FK → users | no | `ON DELETE CASCADE`; part of the primary key. Never the photo's uploader | Gated |
+| `created_at` | TEXT | no | | Gated |
 
 ### `route_reports`
 
@@ -167,6 +187,7 @@ Moderation queue.
 | `details` | TEXT | no | Up to 1,000 chars | Admin |
 | `status` | TEXT | no | `open` → `dismissed` or `removed` | Admin |
 | `created_at` | TEXT | no | | Admin |
+| `image_id` | TEXT FK → route_images | yes | Set when the report is about one photo; `ON DELETE CASCADE`, so removing the photo removes its reports | Admin |
 
 ## Enumerations
 
@@ -212,7 +233,7 @@ All in `STORAGE_DIR`, named `{uuid}.{ext}`, served only by handlers that run the
 ## Deletion and retention
 
 - Deleting a route removes its row, its images and reports (cascade), and its files.
-- Deleting an account (`POST /account/delete`, password required) removes the user row, which cascades to sessions, verification links, routes, route photos and reports on those routes, then removes every file of theirs. Reports they filed on other routes stay, with `reporter_id` set to null.
+- Deleting an account (`POST /account/delete`, password required) removes the user row, which cascades to sessions, verification links, routes, route photos and reports on those routes, the photos and likes they added to other riders' routes, then removes every file of theirs. Reports they filed on other routes stay, with `reporter_id` set to null.
 - Moderation "remove" makes a route private; it deletes nothing.
 - Expired sessions, expired verification links and lapsed `auth_attempts` rows are purged on startup and every hour.
 - Deleting a `users` row by hand in SQL does **not** remove files; use the account deletion flow.

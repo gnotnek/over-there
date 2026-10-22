@@ -60,15 +60,20 @@ Related: [data-catalog.md](data-catalog.md) (what is stored), [service-catalog.m
 | POST | `/logout` | Anyone, CSRF | Deletes session → `/` |
 | GET | `/verify/{token}` | Anyone | Verifies email → `/dashboard?notice=` |
 | GET | `/dashboard` | User | Own routes and totals |
-| GET | `/upload` | User | Upload form (asks to verify email first if needed) |
+| GET | `/upload` | User | Upload form |
 | GET | `/routes/new` | User | Draw-a-route form, same fields as upload with a map instead of the file |
-| POST | `/upload` | Verified, CSRF | Creates route from a GPX or a drawn line → `/routes/{slug}` |
+| POST | `/upload` | User, CSRF | Creates route from a GPX or a drawn line → `/routes/{slug}`; 429 past 5 routes a day without a verified email |
 | GET | `/routes/{slug}/edit` | Owner | Edit form |
 | POST | `/routes/{slug}/edit` | Owner, CSRF | Updates details → `/routes/{slug}` |
 | GET | `/routes/{slug}/line` | Owner | Line editor for a drawn route; 404 for uploaded routes |
 | POST | `/routes/{slug}/line` | Owner, CSRF | Replaces the line ([details](#post-routesslugline)) → `/routes/{slug}` |
 | POST | `/routes/{slug}/delete` | Owner, CSRF | Deletes route and files → `/dashboard` |
 | POST | `/routes/{slug}/report` | Anyone, CSRF | Files a report → `/routes/{slug}?notice=`; 404 for private routes |
+| GET | `/routes/{slug}/photos` | Same as route | Gallery, 24 per page (`?page=`), most liked first |
+| POST | `/routes/{slug}/photos` | User, CSRF | Adds photos ([details](#post-routesslugphotos)) → `/routes/{slug}?notice=` |
+| POST | `/routes/{slug}/photos/{id}/like`, `/unlike` | User, CSRF | Likes or unlikes → `back#photo-{id}`; 403 for your own photo |
+| POST | `/routes/{slug}/photos/{id}/delete` | Uploader or admin, CSRF | Deletes photo and file → `back?notice=` |
+| POST | `/routes/{slug}/photos/{id}/report` | Anyone, CSRF | Reports a photo, same form as route reports → `back?notice=`; 404 for private routes |
 | GET | `/account` | User | Settings form |
 | POST | `/account` | User, CSRF | Updates bio/avatar → `/account?notice=` |
 | POST | `/account/resend-verification` | User, CSRF | New verification email → `/account?notice=` |
@@ -142,6 +147,12 @@ Multipart: `csrf`, `line`, `plan` (see [Drawn line](#drawn-line)). Only for rout
 
 Form: `csrf`, `reason` (`misleading`, `copyright`, `unsafe`, `other`), `details` (≤ 1,000 chars). Signed-out visitors may report.
 
+### `POST /routes/{slug}/photos`
+
+Multipart: `csrf`, `website` (honeypot, must be empty), `photo1`–`photo3` (at least one; JPEG, PNG or WebP, ≤ 5 MB each) and `caption1`–`caption3` (≤ 120 chars). 404 when the route is not viewable; 403 when the rider is not the owner and the route is private or `photos_open` is off; 429 when the rider would pass 5 photos on this route or, without a verified email, 10 photos in a day. A refused submission saves nothing and leaves no files.
+
+Photo forms carry `back`, the page to return to. It must be `/routes/{slug}` or a path under it, otherwise the route page is used.
+
 ### `POST /account`
 
 Multipart: `csrf`, `bio` (≤ 300 chars), `avatar` (optional image). A new avatar replaces and deletes the old one.
@@ -176,7 +187,7 @@ Logout expires `ot_session` with `Max-Age=0`.
 Every POST form includes `<input type="hidden" name="csrf" value="…">`. The server accepts the request only if:
 
 1. `csrf` is non-empty and equals the expected token: the session's `csrf_token` when signed in, otherwise the `ot_csrf` cookie; and
-2. if the request has an `Origin` header, it equals `BASE_URL` exactly.
+2. if the request has an `Origin` header, it equals `BASE_URL` or the request's `Host` with the `BASE_URL` scheme. This also permits local access through `localhost` when `BASE_URL` uses `127.0.0.1`.
 
 Otherwise 403. `SameSite=Lax` cookies add a second layer.
 

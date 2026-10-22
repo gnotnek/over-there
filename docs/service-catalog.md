@@ -119,8 +119,9 @@ Most other SQL still lives in the handlers. Move queries here when a second call
 | Discovery | `home`, `explore`, `profile` | — | Nearby search |
 | Route pages and files | `route_detail`, `route_geometry`, `download`, `route_cover`, `route_image`, `avatar` | `routes.download_count` | Route policy |
 | Contribution | `upload_form`, `draw_form`, `upload`, `edit_form`, `edit_route`, `line_form`, `save_line`, `delete_route`, `dashboard` | `routes`, `route_images`, files | Route policy, GPX processing, Nearby (bbox) |
+| Photos | `add_photos`, `route_photos`, `like_photo`, `unlike_photo`, `delete_photo` | `route_images`, `photo_likes`, files | Route policy (`may_add_photo`, `may_like_photo`, `may_edit`) |
 | Accounts | `register*`, `login*`, `logout`, `verify_email`, `account_*`, `resend_verification`, `delete_account` | `users` (and every cascade from it), `sessions`, `auth_attempts`, `email_verifications`, `email_send_quota`, files | Authentication, Email validation |
-| Moderation | `report_route`, `admin`, `admin_contributor`, `admin_report` | `route_reports`, `routes.visibility`, `users.contributor_verified_at` | — |
+| Moderation | `report_route`, `report_photo`, `admin`, `admin_contributor`, `admin_report` | `route_reports`, `routes.visibility`, `route_images`, `users.contributor_verified_at` | — |
 
 Shared helpers: `viewer` (who is asking, CSRF token), `require_user`, `csrf`, `get_route`, `can_view`/`can_edit`, `render`, `write_asset`/`serve_image`/`remove_assets`, `optimized_image`, `AppError` (logs every 4xx with its reason, every 5xx with its cause).
 

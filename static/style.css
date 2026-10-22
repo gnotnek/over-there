@@ -89,6 +89,12 @@ h1,h2,h3{font-family:var(--display);font-weight:700}
 .filter-form{display:grid;grid-template-columns:1.2fr 1fr 1fr 1fr 95px 95px 1fr auto;gap:12px;align-items:end;padding:22px;background:var(--bg);border-radius:var(--r-card);margin-bottom:32px}
 .filter-form label,.route-form label,.auth-form label,.settings-layout label,.report-panel label{display:flex;flex-direction:column;gap:7px;font-size:13px;font-weight:700}
 .filter-form input,.filter-form select,.route-form input,.route-form select,.route-form textarea,.auth-form input,.settings-layout input,.settings-layout textarea,.report-panel select,.report-panel textarea{width:100%;height:var(--control-h);border:1px solid var(--line);background:var(--white);color:var(--black);padding:0 14px;border-radius:var(--r-control);font-size:14px;font-weight:400}
+.photo-add input{width:100%;height:var(--control-h);border:1px solid var(--line);background:var(--white);color:var(--black);padding:0 14px;border-radius:var(--r-control);font-size:14px}
+.photo-add input[type=file]{padding:10px 14px;height:auto}
+.photo-add form{display:grid;gap:12px}
+.photo-note{margin:16px 0;color:var(--gray)}
+.route-form label.check-field{flex-direction:row;align-items:center;gap:10px;font-weight:400}
+.check-field input{width:20px;height:20px;accent-color:var(--black)}
 .route-form textarea,.settings-layout textarea,.report-panel textarea{height:auto;min-height:var(--control-h);padding:12px 14px;resize:vertical}
 .explore-sheet .route-grid,.app-sheet .route-grid{grid-template-columns:repeat(3,minmax(0,1fr))}
 .explore-split{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,1fr);gap:20px;align-items:start}
@@ -129,6 +135,21 @@ h1,h2,h3{font-family:var(--display);font-weight:700}
 .route-photos h2{font-size:22px}
 .photo-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px}
 .photo-grid img{width:100%;aspect-ratio:4/3;object-fit:cover;border-radius:var(--r-thumb)}
+.photo-card{margin:0;display:flex;flex-direction:column;gap:8px}
+.photo-card figcaption{display:flex;flex-direction:column;gap:4px;font-size:13px}
+.photo-caption{color:var(--black)}
+.photo-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;color:var(--gray)}
+.photo-meta a{color:var(--black);font-weight:700}
+.photo-more{margin-top:16px}
+.photo-actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
+.like-button,.text-button{border:1px solid var(--line);background:var(--white);color:var(--black);border-radius:var(--pill);padding:4px 12px;font-size:13px;cursor:pointer}
+.like-button.liked{background:var(--lime);border-color:var(--lime)}
+.text-button{border-color:transparent;text-decoration:underline}
+.photo-report summary{cursor:pointer;color:var(--gray);font-size:13px}
+.photo-report form{display:grid;gap:8px;margin-top:8px}
+.photo-report label{display:flex;flex-direction:column;gap:4px;font-weight:700}
+.photo-report select,.photo-report textarea{width:100%;border:1px solid var(--line);border-radius:var(--r-control);padding:8px;font-size:13px}
+.admin-photo{border-radius:var(--r-thumb);object-fit:cover}
 .route-attribution{padding:32px 0;border-top:1px solid var(--line)}
 .author-line{display:flex;align-items:center;gap:12px;font-weight:700}
 .author-line img{border-radius:50%;width:44px;height:44px;object-fit:cover}
