@@ -187,7 +187,7 @@ Logout expires `ot_session` with `Max-Age=0`.
 Every POST form includes `<input type="hidden" name="csrf" value="…">`. The server accepts the request only if:
 
 1. `csrf` is non-empty and equals the expected token: the session's `csrf_token` when signed in, otherwise the `ot_csrf` cookie; and
-2. if the request has an `Origin` header, it equals `BASE_URL` exactly.
+2. if the request has an `Origin` header, it equals `BASE_URL` or the request's `Host` with the `BASE_URL` scheme. This also permits local access through `localhost` when `BASE_URL` uses `127.0.0.1`.
 
 Otherwise 403. `SameSite=Lax` cookies add a second layer.
 

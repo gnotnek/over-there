@@ -173,8 +173,16 @@ pub fn check_csrf(headers: &HeaderMap, submitted: &str, expected: &str, base_url
     if submitted.is_empty() || submitted != expected {
         return false;
     }
-    if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let Ok(origin) = origin.to_str() else {
+            return false;
+        };
         origin == base_url.trim_end_matches('/')
+            || headers
+                .get(header::HOST)
+                .and_then(|host| host.to_str().ok())
+                .zip(base_url.split_once("://"))
+                .is_some_and(|(host, (scheme, _))| origin == format!("{scheme}://{host}"))
     } else {
         true
     }
@@ -190,5 +198,19 @@ mod tests {
         assert_ne!(a, b);
         assert!(verify_password("a long test password", &a));
         assert!(!verify_password("other", &a));
+    }
+
+    #[test]
+    fn csrf_accepts_request_origin_and_rejects_other_origins() {
+        let mut headers = HeaderMap::new();
+        let base_url = "http://127.0.0.1:3000";
+        headers.insert(header::HOST, "localhost:3000".parse().unwrap());
+        headers.insert(header::ORIGIN, "http://localhost:3000".parse().unwrap());
+        assert!(check_csrf(&headers, "token", "token", base_url));
+        assert!(!check_csrf(&headers, "wrong", "token", base_url));
+        headers.insert(header::ORIGIN, "http://elsewhere:3000".parse().unwrap());
+        assert!(!check_csrf(&headers, "token", "token", base_url));
+        headers.insert(header::ORIGIN, "https://localhost:3000".parse().unwrap());
+        assert!(!check_csrf(&headers, "token", "token", base_url));
     }
 }
